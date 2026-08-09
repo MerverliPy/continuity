@@ -36,6 +36,7 @@ def build_manifest(
     """Build the deterministic v1 file inventory for a package root."""
 
     records = inventory_tree(root, source_id=package_id)
+    records = tuple(record for record in records if record.normalized_path != "MANIFEST.json")
     return {
         "schema": "continuity.package/v1",
         "package_id": package_id,

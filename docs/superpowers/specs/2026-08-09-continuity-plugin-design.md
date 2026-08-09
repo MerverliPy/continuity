@@ -141,10 +141,12 @@ The version 1 schema identifier is `continuity.package/v1`.
 | `evidence/INDEX.json` | Evidence identity, provenance, validation state, and included or external references |
 | `canonical/` | Selected project files required for safe continuation |
 | `receipts/` | Validation, comparison, test, and approval evidence |
-| `MANIFEST.json` | Machine-readable inventory, schema, status, package ID, and root relationships |
-| `SHA256SUMS.txt` | Integrity hash for every packaged file except the checksum file itself |
+| `MANIFEST.json` | Machine-readable inventory of payload files, schema, status, package ID, and root relationships; its `files` array excludes `MANIFEST.json` and `SHA256SUMS.txt` |
+| `SHA256SUMS.txt` | Actual byte-level SHA-256 for every packaged file except the checksum file itself, including `MANIFEST.json` |
 
 Historical source packages do not need to be duplicated inside every successor. They may be referenced by immutable SHA-256 and package identity when their bytes remain available. Evidence required to continue safely must be embedded in `canonical/` or `receipts/`.
+
+Candidate and canonical outputs are published as one outer release directory. The release directory contains `package/` with the unpacked portable package and `<package_id>.zip` with the deterministic archive of that package. The outer directory crosses one atomic rename boundary, so the unpacked package and ZIP cannot be published separately. The outer release container is transport structure and is not included in the package manifest or checksum inventory.
 
 ## 9. Package lifecycle
 
@@ -213,7 +215,7 @@ Integrity failed, authority conflicts remain, required evidence is missing, the 
 - Require a user decision for conflicting approvals.
 - Inventory unsupported or unreadable files without inventing their contents.
 - Detect likely secrets, redact them from reports, and exclude them from generated packages unless the user explicitly supplies an approved secure handling requirement.
-- Use atomic candidate construction so interruptions cannot produce a promoted partial package.
+- Use one atomically renamed outer release directory for candidate and canonical publication so interruptions cannot expose only the unpacked package or only its ZIP.
 - Keep originals untouched even when candidate creation or validation fails.
 
 ## 14. Capability decisions

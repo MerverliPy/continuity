@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import ctypes
 from dataclasses import dataclass
+from datetime import datetime
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import tempfile
 import zipfile
 
 from .hashing import inventory_tree, sha256_file, verify_sha256s, write_sha256s
-from .models import ApprovalRecord, PackageStatus, ReadinessStatus
+from .models import ApprovalRecord, EvidenceState, PackageStatus, ReadinessStatus
 from .paths import normalize_relative_path
 from .reconciliation import ReconciliationReport
 from .redaction import redact_text
@@ -45,8 +49,11 @@ _ALLOWED_ROOT_ENTRIES = frozenset(
 )
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _CHUNK_SIZE = 1024 * 1024
-_ZERO_SHA256 = "0" * 64
 _APPROVED_DECISIONS = frozenset({"allow", "allowed", "approve", "approved"})
+_RFC3339 = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,7 @@ class CandidateBuildRequest:
 
 @dataclass(frozen=True)
 class CandidateResult:
+    release: Path
     root: Path
     zip_path: Path
     package_id: str
@@ -88,6 +96,7 @@ class PackageValidation:
 
 @dataclass(frozen=True)
 class PromotionResult:
+    release: Path
     root: Path
     zip_path: Path
     package_id: str
@@ -98,7 +107,7 @@ class PromotionResult:
 def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
     """Build, validate, and atomically publish a candidate or blocked package."""
 
-    output, zip_output = _validate_output_paths(request.output)
+    output = _validate_output_path(request.output)
     _validate_request(request)
     status = (
         PackageStatus.BLOCKED
@@ -106,12 +115,16 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
         or request.readiness is ReadinessStatus.BLOCKED
         else PackageStatus.CANDIDATE
     )
+    readiness = (
+        ReadinessStatus.BLOCKED
+        if status is PackageStatus.BLOCKED
+        else request.readiness
+    )
     workspace = Path(
         tempfile.mkdtemp(prefix=f".{output.name}.continuity-build-", dir=output.parent)
     )
     package_root = workspace / "package"
-    temporary_zip = workspace / "package.zip"
-    published_root = False
+    temporary_zip = workspace / f"{request.package_id}.zip"
     try:
         package_root.mkdir()
         for directory in _REQUIRED_DIRECTORIES:
@@ -124,7 +137,10 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
             package_root / "canonical",
             request.secure_handling_approvals,
         )
-        _write_json_new(package_root / "lineage/LINEAGE.json", request.lineage_data)
+        lineage = dict(request.lineage_data)
+        lineage["status"] = status.value
+        lineage["readiness"] = readiness.value
+        _write_json_new(package_root / "lineage/LINEAGE.json", lineage)
         _write_json_new(package_root / "evidence/INDEX.json", request.evidence_index)
         _write_json_new(
             package_root / "receipts/RECONCILIATION.json",
@@ -136,7 +152,7 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
             project_id=request.project_id,
             created_at=request.created_at,
             status=status,
-            readiness=request.readiness,
+            readiness=readiness,
             selected_source_hashes=request.selected_source_hashes,
             lineage_roots=_lineage_roots(request.lineage_data),
             allow_conditional_promotion=request.allow_conditional_promotion,
@@ -146,24 +162,19 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
         if not validation.valid:
             raise ValueError("constructed package is invalid: " + "; ".join(validation.violations))
         _write_reproducible_zip(package_root, temporary_zip)
-        os.replace(package_root, output)
-        published_root = True
-        os.replace(temporary_zip, zip_output)
+        package_sha256 = _package_sha256(package_root)
+        _publish_release_no_replace(workspace, output)
         return CandidateResult(
-            root=output,
-            zip_path=zip_output,
+            release=output,
+            root=output / "package",
+            zip_path=output / f"{request.package_id}.zip",
             package_id=request.package_id,
             status=status,
-            package_sha256=_package_sha256(output),
+            package_sha256=package_sha256,
         )
-    except Exception:
-        if published_root:
-            shutil.rmtree(output)
-        if zip_output.exists():
-            zip_output.unlink()
-        raise
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        if workspace.exists():
+            shutil.rmtree(workspace)
 
 
 def validate_package(root: Path) -> PackageValidation:
@@ -201,24 +212,51 @@ def validate_package(root: Path) -> PackageValidation:
         elif artifact.stat(follow_symlinks=False).st_size == 0:
             violations.append(f"required document is empty: {path}")
 
-    for path in ("lineage/LINEAGE.json", "evidence/INDEX.json", "receipts/RECONCILIATION.json"):
-        _read_json_object(root / path, path, violations)
+    lineage = _read_json_object(root / "lineage/LINEAGE.json", "lineage/LINEAGE.json", violations)
+    evidence_index = _read_json_object(
+        root / "evidence/INDEX.json", "evidence/INDEX.json", violations
+    )
+    reconciliation = _read_json_object(
+        root / "receipts/RECONCILIATION.json",
+        "receipts/RECONCILIATION.json",
+        violations,
+    )
     manifest = _read_json_object(root / "MANIFEST.json", "MANIFEST.json", violations)
     if manifest is not None:
         package_id = _nonempty_string(manifest.get("package_id"), "manifest package_id", violations)
+        project_id = _nonempty_string(
+            manifest.get("project_id"), "manifest project_id", violations
+        )
+        created_at = _rfc3339_value(
+            manifest.get("created_at"), "manifest created_at", violations
+        )
         status = _enum_value(PackageStatus, manifest.get("status"), "manifest status", violations)
         readiness = _enum_value(
             ReadinessStatus, manifest.get("readiness"), "manifest readiness", violations
         )
         if manifest.get("schema") != "continuity.package/v1":
             violations.append("manifest schema must be continuity.package/v1")
+        _validate_string_list(manifest.get("lineage_roots"), "manifest lineage_roots", violations)
+        if not isinstance(manifest.get("allow_conditional_promotion"), bool):
+            violations.append("manifest allow_conditional_promotion must be boolean")
+        _validate_source_hashes(
+            manifest.get("selected_source_hashes"),
+            "manifest selected_source_hashes",
+            violations,
+        )
         _validate_manifest_inventory(root, manifest, violations)
-        if status in {PackageStatus.CANDIDATE, PackageStatus.CANONICAL} and readiness is ReadinessStatus.BLOCKED:
-            violations.append("blocked readiness cannot carry Candidate or Canonical status")
+        if not _valid_lifecycle_pair(status, readiness):
+            violations.append("manifest lifecycle/readiness pair is inconsistent")
+    else:
+        project_id = None
+        created_at = None
 
-    reconciliation = _read_json_object(
-        root / "receipts/RECONCILIATION.json", "receipts/RECONCILIATION.json", []
-    )
+    if lineage is not None:
+        _validate_lineage_structure(lineage, violations)
+    if evidence_index is not None:
+        _validate_evidence_structure(evidence_index, violations)
+    if reconciliation is not None:
+        _validate_reconciliation_structure(reconciliation, violations)
     if (
         reconciliation is not None
         and reconciliation.get("blocking_conflict_ids")
@@ -226,12 +264,28 @@ def validate_package(root: Path) -> PackageValidation:
     ):
         violations.append("blocking reconciliation cannot carry Candidate or Canonical status")
 
-    lineage = _read_json_object(root / "lineage/LINEAGE.json", "lineage/LINEAGE.json", [])
     if lineage is not None and package_id is not None and lineage.get("package_id") != package_id:
         violations.append("lineage package_id does not match manifest")
     if lineage is not None and manifest is not None:
+        if lineage.get("project_id") != project_id:
+            violations.append("lineage project_id does not match manifest")
+        if lineage.get("created_at") != created_at:
+            violations.append("lineage created_at does not match manifest")
+        if lineage.get("status") != manifest.get("status"):
+            violations.append("lineage status does not match manifest")
+        if lineage.get("readiness") != manifest.get("readiness"):
+            violations.append("lineage readiness does not match manifest")
         if lineage.get("source_hashes") != manifest.get("selected_source_hashes"):
             violations.append("lineage source hashes do not match manifest selected sources")
+        if sorted(lineage.get("parent_ids", [])) != manifest.get("lineage_roots"):
+            violations.append("lineage parents do not match manifest lineage_roots")
+
+    if status is PackageStatus.CANONICAL:
+        promotion = _read_json_object(
+            root / "receipts/PROMOTION.json", "receipts/PROMOTION.json", violations
+        )
+        if promotion is not None:
+            _validate_promotion_receipt(promotion, package_id, violations)
 
     checksum_path = root / "SHA256SUMS.txt"
     if not _is_regular_file(checksum_path):
@@ -257,6 +311,7 @@ def promote_candidate(
     candidate: Path,
     output: Path,
     approval: ApprovalRecord | None,
+    successor_created_at: str,
 ) -> PromotionResult:
     """Create a separately validated canonical successor without editing its candidate."""
 
@@ -274,18 +329,19 @@ def promote_candidate(
         raise ValueError("candidate readiness does not permit promotion")
     if validation.package_id is None or not _exact_promotion_approval(approval, validation.package_id):
         raise ValueError("exact promote-candidate approval scoped to the candidate package is required")
+    if not _is_rfc3339(successor_created_at):
+        raise ValueError("successor_created_at must be deterministic RFC3339 text")
 
-    output, zip_output = _validate_output_paths(output)
+    output = _validate_output_path(output)
     successor_id = output.name
-    if not successor_id or successor_id == validation.package_id:
+    if not _is_package_id(successor_id) or successor_id == validation.package_id:
         raise ValueError("canonical successor must have a new package ID")
     candidate_sha256 = _package_sha256(candidate)
     workspace = Path(
         tempfile.mkdtemp(prefix=f".{output.name}.continuity-promote-", dir=output.parent)
     )
     successor_root = workspace / "package"
-    temporary_zip = workspace / "package.zip"
-    published_root = False
+    temporary_zip = workspace / f"{successor_id}.zip"
     try:
         successor_root.mkdir()
         _copy_tree_streaming(candidate, successor_root)
@@ -305,17 +361,24 @@ def promote_candidate(
             },
         )
         _update_successor_lineage(
-            successor_root / "lineage/LINEAGE.json", successor_id, validation.package_id
+            successor_root / "lineage/LINEAGE.json",
+            successor_id,
+            validation.package_id,
+            successor_created_at,
+            validation.readiness,
+        )
+        successor_lineage = json.loads(
+            (successor_root / "lineage/LINEAGE.json").read_text(encoding="utf-8")
         )
         _write_manifest(
             successor_root,
             package_id=successor_id,
             project_id=str(manifest["project_id"]),
-            created_at=str(manifest["created_at"]),
+            created_at=successor_created_at,
             status=PackageStatus.CANONICAL,
             readiness=validation.readiness,
             selected_source_hashes=_string_mapping(manifest.get("selected_source_hashes")),
-            lineage_roots=tuple(str(item) for item in manifest.get("lineage_roots", ())),
+            lineage_roots=_lineage_roots(successor_lineage),
             allow_conditional_promotion=conditional_allowed,
             predecessor_package_id=validation.package_id,
         )
@@ -326,44 +389,66 @@ def promote_candidate(
                 "promoted package is invalid: " + "; ".join(successor_validation.violations)
             )
         _write_reproducible_zip(successor_root, temporary_zip)
-        os.replace(successor_root, output)
-        published_root = True
-        os.replace(temporary_zip, zip_output)
+        package_sha256 = _package_sha256(successor_root)
+        _publish_release_no_replace(workspace, output)
         return PromotionResult(
-            root=output,
-            zip_path=zip_output,
+            release=output,
+            root=output / "package",
+            zip_path=output / f"{successor_id}.zip",
             package_id=successor_id,
             status=PackageStatus.CANONICAL,
-            package_sha256=_package_sha256(output),
+            package_sha256=package_sha256,
         )
-    except Exception:
-        if published_root:
-            shutil.rmtree(output)
-        if zip_output.exists():
-            zip_output.unlink()
-        raise
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        if workspace.exists():
+            shutil.rmtree(workspace)
 
 
 def _validate_request(request: CandidateBuildRequest) -> None:
-    if not request.package_id.strip() or not request.project_id.strip() or not request.created_at.strip():
-        raise ValueError("package_id, project_id, and created_at must be non-empty")
+    if (
+        not _is_package_id(request.package_id)
+        or not isinstance(request.project_id, str)
+        or not request.project_id.strip()
+    ):
+        raise ValueError("package_id must be a portable single path component and project_id non-empty")
+    if not _is_rfc3339(request.created_at):
+        raise ValueError("created_at must be deterministic RFC3339 text")
     if set(request.rendered_documents) != set(_DOCUMENT_PATHS):
         raise ValueError("rendered documents must contain exactly the v1 document paths")
     if any(not isinstance(text, str) or not text.strip() for text in request.rendered_documents.values()):
         raise ValueError("rendered documents must be non-empty text")
     if not isinstance(request.readiness, ReadinessStatus):
         raise ValueError("readiness must be a ReadinessStatus")
-    if not request.selected_source_hashes:
-        raise ValueError("selected source hashes must not be empty")
-    for source_id, digest in request.selected_source_hashes.items():
-        if not source_id.strip() or not _is_sha256(digest):
-            raise ValueError("selected source hashes must map non-empty IDs to SHA-256 values")
+    if not isinstance(request.allow_conditional_promotion, bool):
+        raise ValueError("allow_conditional_promotion must be boolean")
+    source_violations: list[str] = []
+    _validate_source_hashes(
+        request.selected_source_hashes, "selected source hashes", source_violations
+    )
+    if source_violations:
+        raise ValueError(source_violations[0])
     if not isinstance(request.lineage_data, Mapping) or not isinstance(request.evidence_index, Mapping):
         raise ValueError("lineage data and evidence index must be objects")
     if request.lineage_data.get("source_hashes") != dict(request.selected_source_hashes):
         raise ValueError("lineage source hashes must match selected source hashes")
+    lineage_violations: list[str] = []
+    _validate_lineage_structure(request.lineage_data, lineage_violations)
+    if request.lineage_data.get("package_id") != request.package_id:
+        lineage_violations.append("lineage package_id must match request package_id")
+    if request.lineage_data.get("project_id") != request.project_id:
+        lineage_violations.append("lineage project_id must match request project_id")
+    if request.lineage_data.get("created_at") != request.created_at:
+        lineage_violations.append("lineage created_at must match request created_at")
+    if request.lineage_data.get("status") != PackageStatus.CANDIDATE.value:
+        lineage_violations.append("lineage status must be Candidate in a build request")
+    if request.lineage_data.get("readiness") != request.readiness.value:
+        lineage_violations.append("lineage readiness must match request readiness")
+    if lineage_violations:
+        raise ValueError(lineage_violations[0])
+    evidence_violations: list[str] = []
+    _validate_evidence_structure(request.evidence_index, evidence_violations)
+    if evidence_violations:
+        raise ValueError(evidence_violations[0])
     try:
         json.dumps(request.lineage_data)
         json.dumps(request.evidence_index)
@@ -372,16 +457,51 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         raise ValueError("structured package inputs must be JSON serializable") from error
 
 
-def _validate_output_paths(output: Path) -> tuple[Path, Path]:
+def _validate_output_path(output: Path) -> Path:
     output = Path(output)
     if not output.name:
         raise ValueError("output must name a package directory")
     if not output.parent.is_dir():
         raise FileNotFoundError(f"output parent does not exist: {output.parent}")
-    zip_output = output.with_suffix(".zip")
-    if os.path.lexists(output) or os.path.lexists(zip_output):
-        raise FileExistsError("package output or ZIP already exists")
-    return output, zip_output
+    if os.path.lexists(output):
+        raise FileExistsError("release output already exists")
+    return output
+
+
+def _publish_release_no_replace(temporary_release: Path, destination: Path) -> None:
+    """Atomically publish one release directory without replacing a racing path."""
+
+    if os.name != "posix":
+        raise RuntimeError("atomic no-replace release publication is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace release publication is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    rename_noreplace = 1
+    result = renameat2(
+        at_fdcwd,
+        os.fsencode(temporary_release),
+        at_fdcwd,
+        os.fsencode(destination),
+        rename_noreplace,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    if error_number in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        raise RuntimeError("atomic no-replace release publication is unavailable")
+    raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _copy_canonical_files(
@@ -431,11 +551,16 @@ def _require_secret_approval(
         return
     if not redact_text(text).findings:
         return
-    accepted_paths = {destination, f"canonical/{destination}"}
+    approved_path = f"canonical/{destination}"
     exact = any(
-        _normalize(approval.action) == "secure handling"
+        approval.action == "secure-handling"
         and _normalize(approval.decision) in _APPROVED_DECISIONS
-        and any(path in accepted_paths for path in approval.scope)
+        and bool(approval.approval_id.strip())
+        and bool(approval.source_id.strip())
+        and bool(approval.source_ref.strip())
+        and _is_rfc3339(approval.approved_at)
+        and approved_path in approval.scope
+        and all(_is_exact_normalized_package_path(path) for path in approval.scope)
         for approval in approvals
     )
     if not exact:
@@ -482,6 +607,7 @@ def _write_manifest(
     predecessor_package_id: str | None = None,
 ) -> None:
     records = inventory_tree(root, source_id=package_id)
+    records = tuple(record for record in records if record.normalized_path != "MANIFEST.json")
     files = [
         {"path": record.normalized_path, "sha256": record.sha256, "size_bytes": record.size_bytes}
         for record in records
@@ -500,20 +626,8 @@ def _write_manifest(
     }
     if predecessor_package_id is not None:
         manifest["predecessor_package_id"] = predecessor_package_id
-    self_entry = {"path": "MANIFEST.json", "sha256": _ZERO_SHA256, "size_bytes": 0}
-    files.append(self_entry)
     files.sort(key=lambda item: str(item["path"]))
-    for _ in range(8):
-        self_entry["sha256"] = _manifest_self_digest(manifest)
-        encoded = _json_bytes(manifest)
-        if self_entry["size_bytes"] == len(encoded):
-            break
-        self_entry["size_bytes"] = len(encoded)
-    self_entry["sha256"] = _manifest_self_digest(manifest)
-    encoded = _json_bytes(manifest)
-    if self_entry["size_bytes"] != len(encoded):
-        raise ValueError("manifest size did not stabilize")
-    _write_bytes_new(root / "MANIFEST.json", encoded)
+    _write_bytes_new(root / "MANIFEST.json", _json_bytes(manifest))
 
 
 def _validate_manifest_inventory(
@@ -547,6 +661,7 @@ def _validate_manifest_inventory(
         violations.append(f"could not inventory package: {error}")
         return
     observed = {record.normalized_path: record for record in records}
+    observed.pop("MANIFEST.json", None)
     if set(entries) != set(observed):
         missing = sorted(set(observed) - set(entries))
         unexpected = sorted(set(entries) - set(observed))
@@ -564,20 +679,8 @@ def _validate_manifest_inventory(
             continue
         if size != record.size_bytes:
             violations.append(f"manifest size differs for {path}")
-        expected_digest = (
-            _manifest_self_digest(manifest) if path == "MANIFEST.json" else record.sha256
-        )
-        if digest != expected_digest:
+        if digest != record.sha256:
             violations.append(f"manifest digest differs for {path}")
-
-
-def _manifest_self_digest(manifest: Mapping[str, object]) -> str:
-    normalized = json.loads(json.dumps(manifest))
-    files = normalized.get("files", [])
-    for item in files:
-        if isinstance(item, dict) and item.get("path") == "MANIFEST.json":
-            item["sha256"] = _ZERO_SHA256
-    return hashlib.sha256(_json_bytes(normalized)).hexdigest()
 
 
 def _write_reproducible_zip(root: Path, destination: Path) -> None:
@@ -616,7 +719,13 @@ def _write_reproducible_zip(root: Path, destination: Path) -> None:
                     os.close(descriptor)
 
 
-def _update_successor_lineage(path: Path, successor_id: str, candidate_id: str) -> None:
+def _update_successor_lineage(
+    path: Path,
+    successor_id: str,
+    candidate_id: str,
+    successor_created_at: str,
+    readiness: ReadinessStatus,
+) -> None:
     lineage = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(lineage, dict):
         raise ValueError("lineage data must be an object")
@@ -624,6 +733,9 @@ def _update_successor_lineage(path: Path, successor_id: str, candidate_id: str) 
     if not isinstance(existing, list) or any(not isinstance(item, str) for item in existing):
         raise ValueError("lineage parent_ids must be a string list")
     lineage["package_id"] = successor_id
+    lineage["created_at"] = successor_created_at
+    lineage["status"] = PackageStatus.CANONICAL.value
+    lineage["readiness"] = readiness.value
     lineage["parent_ids"] = sorted(set(existing) | {candidate_id})
     path.unlink()
     _write_json_new(path, lineage)
@@ -714,7 +826,7 @@ def _exact_promotion_approval(approval: ApprovalRecord | None, package_id: str) 
         and approval.approval_id.strip()
         and approval.source_id.strip()
         and approval.source_ref.strip()
-        and approval.approved_at.strip()
+        and _is_rfc3339(approval.approved_at)
     )
 
 
@@ -744,6 +856,16 @@ def _is_sha256(value: object) -> bool:
     return value == value.lower()
 
 
+def _is_package_id(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value.strip()
+        and value == value.strip()
+        and value not in {".", ".."}
+        and not any(character in value for character in "/\\\x00")
+    )
+
+
 def _enum_value(enum: type, value: object, label: str, violations: list[str]):
     try:
         return enum(value)
@@ -765,6 +887,150 @@ def _string_mapping(value: object) -> dict[str, str]:
     ):
         raise ValueError("selected_source_hashes must be a string mapping")
     return dict(value)
+
+
+def _validate_lineage_structure(
+    lineage: Mapping[str, object], violations: list[str]
+) -> None:
+    if lineage.get("schema") != "continuity.lineage/v1":
+        violations.append("lineage schema must be continuity.lineage/v1")
+    _nonempty_string(lineage.get("package_id"), "lineage package_id", violations)
+    _nonempty_string(lineage.get("project_id"), "lineage project_id", violations)
+    _rfc3339_value(lineage.get("created_at"), "lineage created_at", violations)
+    _enum_value(PackageStatus, lineage.get("status"), "lineage status", violations)
+    _enum_value(ReadinessStatus, lineage.get("readiness"), "lineage readiness", violations)
+    _validate_string_list(lineage.get("parent_ids"), "lineage parent_ids", violations)
+    _validate_source_hashes(lineage.get("source_hashes"), "lineage source_hashes", violations)
+
+
+def _validate_evidence_structure(
+    evidence: Mapping[str, object], violations: list[str]
+) -> None:
+    if evidence.get("schema") != "continuity.evidence-index/v1":
+        violations.append("evidence schema must be continuity.evidence-index/v1")
+    items = evidence.get("items")
+    if not isinstance(items, list) or not items:
+        violations.append("evidence items must be a non-empty list")
+        return
+    for index, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            violations.append(f"evidence item {index} must be an object")
+            continue
+        _nonempty_string(item.get("source_id"), f"evidence item {index} source_id", violations)
+        _nonempty_string(item.get("reference"), f"evidence item {index} reference", violations)
+        _enum_value(EvidenceState, item.get("state"), f"evidence item {index} state", violations)
+
+
+def _validate_reconciliation_structure(
+    reconciliation: Mapping[str, object], violations: list[str]
+) -> None:
+    list_fields = (
+        "claims",
+        "conflicts",
+        "findings",
+        "approvals",
+        "selected_claim_ids",
+        "blocking_conflict_ids",
+        "notes",
+    )
+    for field in list_fields:
+        if not isinstance(reconciliation.get(field), list):
+            violations.append(f"reconciliation {field} must be a list")
+    if isinstance(reconciliation.get("findings"), list) and not reconciliation["findings"]:
+        violations.append("reconciliation findings must be non-empty")
+
+
+def _validate_promotion_receipt(
+    receipt: Mapping[str, object], package_id: str | None, violations: list[str]
+) -> None:
+    if receipt.get("schema") != "continuity.promotion-receipt/v1":
+        violations.append("promotion receipt schema is invalid")
+    _nonempty_string(
+        receipt.get("candidate_package_id"),
+        "promotion receipt candidate_package_id",
+        violations,
+    )
+    candidate_hash = receipt.get("candidate_sha256")
+    if not _is_sha256(candidate_hash):
+        violations.append("promotion receipt candidate_sha256 is invalid")
+    if receipt.get("canonical_package_id") != package_id:
+        violations.append("promotion receipt canonical_package_id does not match manifest")
+    approval = receipt.get("approval")
+    if not isinstance(approval, Mapping):
+        violations.append("promotion receipt approval must be an object")
+        return
+    for field in ("approval_id", "source_id", "source_ref"):
+        _nonempty_string(approval.get(field), f"promotion approval {field}", violations)
+    _rfc3339_value(approval.get("approved_at"), "promotion approval approved_at", violations)
+    if approval.get("action") != "promote-candidate":
+        violations.append("promotion approval action is invalid")
+    scope = approval.get("scope")
+    if not isinstance(scope, list) or len(scope) != 1 or scope[0] != receipt.get(
+        "candidate_package_id"
+    ):
+        violations.append("promotion approval scope is invalid")
+    if not isinstance(approval.get("decision"), str) or _normalize(
+        approval["decision"]
+    ) not in _APPROVED_DECISIONS:
+        violations.append("promotion approval decision is invalid")
+
+
+def _validate_source_hashes(value: object, label: str, violations: list[str]) -> None:
+    if not isinstance(value, Mapping) or not value:
+        violations.append(f"{label} must be a non-empty mapping")
+        return
+    for source_id, digest in value.items():
+        if not isinstance(source_id, str) or not source_id.strip() or not _is_sha256(digest):
+            violations.append(f"{label} must map non-empty source IDs to SHA-256 values")
+            return
+
+
+def _validate_string_list(value: object, label: str, violations: list[str]) -> None:
+    if not isinstance(value, list):
+        violations.append(f"{label} must be a list")
+        return
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        violations.append(f"{label} must contain non-empty text")
+    elif len(value) != len(set(value)) or value != sorted(value):
+        violations.append(f"{label} must be unique and sorted")
+
+
+def _valid_lifecycle_pair(
+    status: PackageStatus | None, readiness: ReadinessStatus | None
+) -> bool:
+    allowed = {
+        PackageStatus.CANDIDATE: {ReadinessStatus.READY, ReadinessStatus.CONDITIONAL},
+        PackageStatus.BLOCKED: {ReadinessStatus.BLOCKED},
+        PackageStatus.CANONICAL: {ReadinessStatus.READY, ReadinessStatus.CONDITIONAL},
+        PackageStatus.SUPERSEDED: {ReadinessStatus.BLOCKED},
+    }
+    return status in allowed and readiness in allowed[status]
+
+
+def _rfc3339_value(value: object, label: str, violations: list[str]) -> str | None:
+    if not _is_rfc3339(value):
+        violations.append(f"{label} must be deterministic RFC3339 text")
+        return None
+    return value
+
+
+def _is_rfc3339(value: object) -> bool:
+    if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def _is_exact_normalized_package_path(value: object) -> bool:
+    if not isinstance(value, str) or any(character in value for character in "*?[]"):
+        return False
+    try:
+        return normalize_relative_path(value) == value
+    except ValueError:
+        return False
 
 
 def _normalize(value: str) -> str:

@@ -185,7 +185,7 @@ classify_readiness(report: ReconciliationReport, requested_action: str) -> Prefl
 redact_text(text: str) -> RedactionResult
 build_candidate(request: CandidateBuildRequest) -> CandidateResult
 validate_package(root: Path) -> PackageValidation
-promote_candidate(candidate: Path, output: Path, approval: ApprovalRecord) -> PromotionResult
+promote_candidate(candidate: Path, output: Path, approval: ApprovalRecord, successor_created_at: str) -> PromotionResult
 ```
 
 CLI contract:
@@ -195,7 +195,7 @@ continuity_cli.py inspect INPUT --output REPORT.json
 continuity_cli.py reconcile --claims CLAIMS.json --approvals APPROVALS.json --integrity INTEGRITY.json --output REPORT.json
 continuity_cli.py build --request BUILD_REQUEST.json --output-dir DIR
 continuity_cli.py validate PACKAGE_OR_ZIP --output REPORT.json
-continuity_cli.py promote CANDIDATE --approval APPROVAL.json --output DIR
+continuity_cli.py promote CANDIDATE --approval APPROVAL.json --created-at RFC3339 --output DIR
 continuity_cli.py preflight --reconciliation REPORT.json --requested-action ACTION --output PREFLIGHT.json
 ```
 
@@ -354,7 +354,7 @@ Read files in fixed-size chunks. Sort by normalized relative path. Do not follow
 }
 ```
 
-Exclude `SHA256SUMS.txt` from `files` to avoid a recursive checksum. Include every other regular file. `compare_manifests` returns sorted `missing`, `unexpected`, and `changed` paths and must not collapse hash mismatches into missing files.
+Exclude both `MANIFEST.json` and `SHA256SUMS.txt` from the manifest `files` array to avoid recursive self-hashing. Include every other regular payload file. `SHA256SUMS.txt` separately records the actual byte digest of `MANIFEST.json` and every other regular file except itself. `compare_manifests` returns sorted `missing`, `unexpected`, and `changed` paths and must not collapse hash mismatches into missing files.
 
 - [ ] **Step 6: Run focused and full tests.**
 
@@ -626,7 +626,7 @@ Create a complete request fixture in Python and assert candidate output contains
 Assert:
 
 - source directory and input ZIP hashes are unchanged;
-- all regular files except `SHA256SUMS.txt` are in both manifest and checksum inventory;
+- every regular payload file except `MANIFEST.json` and `SHA256SUMS.txt` is in the manifest, while every regular file except `SHA256SUMS.txt` (including `MANIFEST.json`) is in the checksum inventory;
 - ZIP entry metadata uses a fixed timestamp and sorted order for reproducibility;
 - identical normalized requests produce byte-identical ZIPs when `created_at` is supplied;
 - failed construction leaves no output directory or partial ZIP;
@@ -646,7 +646,7 @@ Expected: import failure for `continuity.packaging`.
 
 `CandidateBuildRequest` must contain package ID, project ID, explicit `created_at`, selected source hashes, approved reconciliation report, canonical file mappings, rendered document contents, lineage data, evidence index, and secure-handling approvals.
 
-Build in a tool-owned temporary directory. Copy files by streaming bytes without following symlinks. Render supplied structured content through fixed templates in Task 8; until those files exist, tests may supply template text directly through the request. Validate, generate manifest, generate checksums, write a reproducible ZIP to a temporary file, then atomically rename outputs.
+Build in a tool-owned temporary outer release directory. Copy files into `package/` by streaming bytes without following symlinks. Render supplied structured content through fixed templates in Task 8; until those files exist, tests may supply template text directly through the request. Validate, generate the manifest and checksums, and write `<package_id>.zip` beside `package/`. Atomically rename the single outer release directory to its final path using no-clobber publication semantics. The ZIP contains the contents of `package/` at its archive root; the outer release directory is transport structure and is not inventoried.
 
 - [ ] **Step 4: Implement validation and append-only promotion.**
 
@@ -657,10 +657,10 @@ Validation must independently recalculate every digest and compare the package c
 3. verify scoped explicit approval;
 4. copy to a new temporary root;
 5. add `receipts/PROMOTION.json` with candidate hash and approval provenance;
-6. set new status `Canonical` and a new package ID or approved successor ID;
+6. set new status `Canonical`, a new package ID or approved successor ID, and the explicit deterministic `successor_created_at` in both manifest and lineage;
 7. regenerate manifest and checksums;
 8. validate again;
-9. atomically publish the canonical directory and ZIP.
+9. place the canonical `package/` directory and `<package_id>.zip` inside one temporary outer release directory, then atomically publish that outer directory with no-clobber semantics.
 
 - [ ] **Step 5: Run focused and full tests.**
 

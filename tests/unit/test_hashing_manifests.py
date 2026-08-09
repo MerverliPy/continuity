@@ -153,11 +153,12 @@ def test_inventory_does_not_follow_symbolic_links(tmp_path: Path) -> None:
     assert [record.normalized_path for record in records] == ["target.txt"]
 
 
-def test_manifest_is_sorted_and_excludes_checksum_file(tmp_path: Path) -> None:
-    """Catches non-deterministic manifests and recursive checksum inclusion."""
+def test_manifest_is_sorted_and_excludes_integrity_metadata(tmp_path: Path) -> None:
+    """Catches non-deterministic manifests or recursive integrity metadata inclusion."""
     (tmp_path / "z.txt").write_text("z", encoding="utf-8")
     (tmp_path / "A").mkdir()
     (tmp_path / "A/a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "MANIFEST.json").write_text("{}", encoding="utf-8")
     (tmp_path / "SHA256SUMS.txt").write_text("not inventory", encoding="utf-8")
 
     manifest = build_manifest(

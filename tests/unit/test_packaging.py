@@ -16,6 +16,7 @@ from continuity.models import (
 )
 from continuity.packaging import (
     CandidateBuildRequest,
+    _publish_release_no_replace,
     build_candidate,
     promote_candidate,
     validate_package,
@@ -103,6 +104,10 @@ def _request(
         lineage_data={
             "schema": "continuity.lineage/v1",
             "package_id": package_id,
+            "project_id": "alpha",
+            "created_at": "2026-08-09T12:00:00Z",
+            "status": "Candidate",
+            "readiness": readiness.value,
             "parent_ids": [],
             "source_hashes": {
                 "source-tree": _tree_hash(source_root),
@@ -164,6 +169,9 @@ def test_candidate_contract_is_complete_and_sources_are_unchanged(tmp_path: Path
 
     result = build_candidate(request)
 
+    assert result.release == request.output
+    assert result.root == request.output / "package"
+    assert result.zip_path == request.output / "candidate-alpha.zip"
     regular_paths = set(_package_snapshot(result.root))
     assert regular_paths == {
         *DOCUMENT_PATHS,
@@ -186,7 +194,8 @@ def test_candidate_contract_is_complete_and_sources_are_unchanged(tmp_path: Path
 def test_manifest_and_checksums_cover_every_regular_file(tmp_path: Path) -> None:
     """Catches a packaged file escaping either integrity inventory."""
     result = build_candidate(_request(tmp_path))
-    regular = set(_package_snapshot(result.root)) - {"SHA256SUMS.txt"}
+    checksummed = set(_package_snapshot(result.root)) - {"SHA256SUMS.txt"}
+    payload = checksummed - {"MANIFEST.json"}
     manifest = json.loads((result.root / "MANIFEST.json").read_text(encoding="utf-8"))
     manifest_paths = {item["path"] for item in manifest["files"]}
     checksum_paths = {
@@ -194,8 +203,13 @@ def test_manifest_and_checksums_cover_every_regular_file(tmp_path: Path) -> None
         for line in (result.root / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
     }
 
-    assert manifest_paths == regular
-    assert checksum_paths == regular
+    assert manifest_paths == payload
+    assert checksum_paths == checksummed
+    manifest_line = next(
+        line for line in (result.root / "SHA256SUMS.txt").read_text().splitlines()
+        if line.endswith("  MANIFEST.json")
+    )
+    assert manifest_line == f"{sha256_file(result.root / 'MANIFEST.json')}  MANIFEST.json"
 
 
 def test_validation_recalculates_digests_from_current_bytes(tmp_path: Path) -> None:
@@ -208,6 +222,46 @@ def test_validation_recalculates_digests_from_current_bytes(tmp_path: Path) -> N
     assert not validation.valid
     assert any("digest differs" in violation for violation in validation.violations)
     assert any("checksum inventory" in violation for violation in validation.violations)
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_message"),
+    (
+        ("project_id", "project_id"),
+        ("created_at", "created_at"),
+        ("lineage_roots", "lineage_roots"),
+        ("allow_conditional_promotion", "allow_conditional_promotion"),
+        ("selected_source_hashes", "selected_source_hashes"),
+    ),
+)
+def test_validation_rejects_incomplete_manifest_structure(
+    tmp_path: Path, field: str, expected_message: str
+) -> None:
+    """Catches checksum-validity logic overlooking required manifest structure."""
+    result = build_candidate(_request(tmp_path))
+    manifest_path = result.root / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop(field)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any(expected_message in violation for violation in validation.violations)
+
+
+def test_validation_rejects_blocked_status_with_ready_readiness(tmp_path: Path) -> None:
+    """Catches inconsistent lifecycle pairs being treated as safely blocked."""
+    result = build_candidate(_request(tmp_path))
+    manifest_path = result.root / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "Blocked"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("lifecycle/readiness" in violation for violation in validation.violations)
 
 
 def test_candidate_zip_has_sorted_entries_and_fixed_metadata(tmp_path: Path) -> None:
@@ -246,7 +300,6 @@ def test_failed_construction_publishes_neither_directory_nor_zip(tmp_path: Path)
         build_candidate(request)
 
     assert not request.output.exists()
-    assert not request.output.with_suffix(".zip").exists()
 
 
 def test_build_never_overwrites_existing_output(tmp_path: Path) -> None:
@@ -260,7 +313,23 @@ def test_build_never_overwrites_existing_output(tmp_path: Path) -> None:
         build_candidate(request)
 
     assert sentinel.read_text(encoding="utf-8") == "prior output\n"
-    assert not request.output.with_suffix(".zip").exists()
+
+
+def test_atomic_release_publication_never_replaces_a_racing_destination(tmp_path: Path) -> None:
+    """Catches a destination created after validation being overwritten at publication."""
+    temporary_release = tmp_path / ".temporary-release"
+    temporary_release.mkdir()
+    (temporary_release / "new.txt").write_text("new bytes\n", encoding="utf-8")
+    destination = tmp_path / "release"
+    destination.mkdir()
+    sentinel = destination / "owned.txt"
+    sentinel.write_text("racing owner\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        _publish_release_no_replace(temporary_release, destination)
+
+    assert sentinel.read_text(encoding="utf-8") == "racing owner\n"
+    assert temporary_release.is_dir()
 
 
 @pytest.mark.parametrize("destination", ("../escape.py", "/absolute.py", "C:\\escape.py"))
@@ -274,6 +343,21 @@ def test_unsafe_canonical_destination_is_rejected(tmp_path: Path, destination: s
         build_candidate(request)
 
     assert not request.output.exists()
+
+
+@pytest.mark.parametrize("package_id", ("../escape", "nested/package", "nested\\package"))
+def test_package_id_cannot_redirect_release_zip(tmp_path: Path, package_id: str) -> None:
+    """Catches package identity being interpreted as a path outside the temporary release."""
+    request = _request(tmp_path, package_id=package_id)
+    request = CandidateBuildRequest(
+        **{**request.__dict__, "output": tmp_path / "release"}
+    )
+
+    with pytest.raises(ValueError, match="package_id"):
+        build_candidate(request)
+
+    assert not request.output.exists()
+    assert not (tmp_path / "escape.zip").exists()
 
 
 def test_canonical_symlink_source_is_rejected_without_following(tmp_path: Path) -> None:
@@ -293,8 +377,8 @@ def test_secret_bearing_file_requires_path_specific_secure_handling_approval(tmp
     secret.write_text("API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8")
     unrelated = ApprovalRecord(
         "approval-secret-other",
-        "secure handling",
-        ("other.env",),
+        "secure-handling",
+        ("canonical/other.env",),
         "approved",
         "user",
         "conversation://approval/41",
@@ -312,8 +396,8 @@ def test_secret_bearing_file_requires_path_specific_secure_handling_approval(tmp
 
     exact = ApprovalRecord(
         "approval-secret-exact",
-        "secure handling",
-        ("secrets.env",),
+        "secure-handling",
+        ("canonical/secrets.env",),
         "approved",
         "user",
         "conversation://approval/43",
@@ -337,8 +421,8 @@ def test_secure_handling_approval_must_enumerate_each_secret_path(tmp_path: Path
     second.write_text("PASSWORD=highly-sensitive-password\n", encoding="utf-8")
     enumerated = ApprovalRecord(
         "approval-secret-enumerated",
-        "secure handling",
-        ("first.env", "second.env"),
+        "secure-handling",
+        ("canonical/first.env", "canonical/second.env"),
         "approved",
         "user",
         "conversation://approval/44",
@@ -357,6 +441,46 @@ def test_secure_handling_approval_must_enumerate_each_secret_path(tmp_path: Path
     assert (result.root / "canonical/second.env").read_bytes() == second.read_bytes()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("approval_id", ""),
+        ("source_id", " "),
+        ("source_ref", ""),
+        ("approved_at", "not-a-time"),
+        ("action", "secure handling"),
+        ("scope", ("canonical/*.env",)),
+        ("scope", ("canonical/secrets.env", "canonical/*.env")),
+    ),
+)
+def test_secret_approval_requires_complete_exact_provenance(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Catches unauditable or wildcard secret authority entering the package."""
+    secret = tmp_path / "secrets.env"
+    secret.write_text("API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8")
+    values = {
+        "approval_id": "approval-secret-exact",
+        "action": "secure-handling",
+        "scope": ("canonical/secrets.env",),
+        "decision": "approved",
+        "source_id": "user",
+        "source_ref": "conversation://approval/43",
+        "approved_at": "2026-08-09T11:30:00Z",
+    }
+    values[field] = value
+    approval = ApprovalRecord(**values)
+
+    with pytest.raises(ValueError, match="secure-handling approval"):
+        build_candidate(
+            _request(
+                tmp_path,
+                canonical_files={"secrets.env": secret},
+                secure_handling_approvals=(approval,),
+            )
+        )
+
+
 def test_lineage_source_hashes_must_match_selected_sources(tmp_path: Path) -> None:
     """Catches lineage naming different evidence bytes than the package manifest."""
     request = _request(tmp_path)
@@ -373,7 +497,84 @@ def test_lineage_source_hashes_must_match_selected_sources(tmp_path: Path) -> No
         build_candidate(request)
 
     assert not request.output.exists()
-    assert not request.output.with_suffix(".zip").exists()
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field"),
+    (
+        ("lineage_data", "schema"),
+        ("lineage_data", "project_id"),
+        ("lineage_data", "created_at"),
+        ("lineage_data", "status"),
+        ("lineage_data", "readiness"),
+        ("lineage_data", "parent_ids"),
+        ("lineage_data", "source_hashes"),
+        ("evidence_index", "schema"),
+        ("evidence_index", "items"),
+    ),
+)
+def test_incomplete_structured_request_is_rejected_before_publication(
+    tmp_path: Path, artifact: str, field: str
+) -> None:
+    """Catches incomplete machine-readable contract artifacts reaching a release."""
+    request = _request(tmp_path)
+    incomplete = dict(getattr(request, artifact))
+    incomplete.pop(field)
+    request = CandidateBuildRequest(**{**request.__dict__, artifact: incomplete})
+
+    with pytest.raises(ValueError):
+        build_candidate(request)
+
+    assert not request.output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("status", "Canonical"), ("readiness", "Conditional")),
+)
+def test_request_lineage_lifecycle_must_match_candidate_inputs(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    """Catches contradictory request lineage being silently overwritten during build."""
+    request = _request(tmp_path)
+    request = CandidateBuildRequest(
+        **{
+            **request.__dict__,
+            "lineage_data": {**request.lineage_data, field: value},
+        }
+    )
+
+    with pytest.raises(ValueError, match=field):
+        build_candidate(request)
+
+
+def test_empty_evidence_index_is_rejected_before_publication(tmp_path: Path) -> None:
+    """Catches an evidence index schema label substituting for actual evidence."""
+    request = _request(tmp_path)
+    request = CandidateBuildRequest(
+        **{**request.__dict__, "evidence_index": {**request.evidence_index, "items": []}}
+    )
+
+    with pytest.raises(ValueError, match="evidence"):
+        build_candidate(request)
+
+    assert not request.output.exists()
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    ("", "2026-08-09", "2026-08-09 12:00:00Z", "2026-13-09T12:00:00Z"),
+)
+def test_build_rejects_non_rfc3339_creation_time(tmp_path: Path, created_at: str) -> None:
+    """Catches ambiguous or invalid creation timestamps entering identity metadata."""
+    request = _request(tmp_path)
+    lineage = {**request.lineage_data, "created_at": created_at}
+    request = CandidateBuildRequest(
+        **{**request.__dict__, "created_at": created_at, "lineage_data": lineage}
+    )
+
+    with pytest.raises(ValueError, match="RFC3339"):
+        build_candidate(request)
 
 
 def test_blocking_reconciliation_builds_only_blocked_status(tmp_path: Path) -> None:
@@ -383,8 +584,14 @@ def test_blocking_reconciliation_builds_only_blocked_status(tmp_path: Path) -> N
 
     assert result.status is PackageStatus.BLOCKED
     assert manifest["status"] == "Blocked"
+    assert manifest["readiness"] == "Blocked"
     with pytest.raises(ValueError, match="Candidate"):
-        promote_candidate(result.root, tmp_path / "canonical-alpha", _approval(result.package_id))
+        promote_candidate(
+            result.root,
+            tmp_path / "canonical-alpha",
+            _approval(result.package_id),
+            "2026-08-09T14:00:00Z",
+        )
 
 
 @pytest.mark.parametrize(
@@ -402,7 +609,12 @@ def test_promotion_requires_exact_action_and_candidate_scope(
     candidate = build_candidate(_request(tmp_path))
 
     with pytest.raises(ValueError, match="approval"):
-        promote_candidate(candidate.root, tmp_path / "canonical-alpha", approval)
+        promote_candidate(
+            candidate.root,
+            tmp_path / "canonical-alpha",
+            approval,
+            "2026-08-09T14:00:00Z",
+        )
 
     assert not (tmp_path / "canonical-alpha").exists()
     assert not (tmp_path / "canonical-alpha.zip").exists()
@@ -418,17 +630,25 @@ def test_promotion_is_append_only_and_regenerates_integrity_artifacts(tmp_path: 
         candidate.root,
         tmp_path / "canonical-alpha",
         _approval(candidate.package_id),
+        "2026-08-09T14:00:00Z",
     )
 
     assert canonical.root != candidate.root
     assert canonical.status is PackageStatus.CANONICAL
     assert canonical.package_id == "canonical-alpha"
+    assert canonical.release == tmp_path / "canonical-alpha"
+    assert canonical.root == canonical.release / "package"
+    assert canonical.zip_path == canonical.release / "canonical-alpha.zip"
     assert validate_package(canonical.root).valid
     assert (canonical.root / "receipts/PROMOTION.json").is_file()
     receipt = json.loads((canonical.root / "receipts/PROMOTION.json").read_text(encoding="utf-8"))
     assert receipt["candidate_package_id"] == candidate.package_id
     assert receipt["candidate_sha256"] == candidate.package_sha256
     assert receipt["approval"]["approval_id"] == "approval-promote-alpha"
+    successor_manifest = json.loads((canonical.root / "MANIFEST.json").read_text())
+    successor_lineage = json.loads((canonical.root / "lineage/LINEAGE.json").read_text())
+    assert successor_manifest["created_at"] == "2026-08-09T14:00:00Z"
+    assert successor_lineage["created_at"] == "2026-08-09T14:00:00Z"
     assert _package_snapshot(candidate.root) == candidate_before
     assert candidate.zip_path.read_bytes() == candidate_zip_before
     assert canonical.zip_path.read_bytes() != candidate.zip_path.read_bytes()
@@ -447,6 +667,7 @@ def test_conditional_candidate_requires_explicit_build_permission_to_promote(
             candidate.root,
             tmp_path / "canonical-conditional",
             _approval(candidate.package_id),
+            "2026-08-09T14:00:00Z",
         )
 
 
@@ -464,6 +685,7 @@ def test_recorded_conditional_allowance_permits_exactly_approved_promotion(
         candidate.root,
         tmp_path / "canonical-conditional",
         _approval(candidate.package_id),
+        "2026-08-09T14:00:00Z",
     )
 
     assert canonical.status is PackageStatus.CANONICAL
@@ -480,4 +702,27 @@ def test_only_candidate_status_can_be_promoted(tmp_path: Path, status: PackageSt
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
 
     with pytest.raises(ValueError):
-        promote_candidate(candidate.root, tmp_path / f"successor-{status.value}", _approval(candidate.package_id))
+        promote_candidate(
+            candidate.root,
+            tmp_path / f"successor-{status.value}",
+            _approval(candidate.package_id),
+            "2026-08-09T14:00:00Z",
+        )
+
+
+@pytest.mark.parametrize("created_at", ("", "2026-08-09", "tomorrow"))
+def test_promotion_requires_explicit_rfc3339_successor_time(
+    tmp_path: Path, created_at: str
+) -> None:
+    """Catches promotion reusing candidate time or accepting ambiguous successor time."""
+    candidate = build_candidate(_request(tmp_path))
+
+    with pytest.raises(ValueError, match="RFC3339"):
+        promote_candidate(
+            candidate.root,
+            tmp_path / "canonical-alpha",
+            _approval(candidate.package_id),
+            created_at,
+        )
+
+    assert not (tmp_path / "canonical-alpha").exists()
