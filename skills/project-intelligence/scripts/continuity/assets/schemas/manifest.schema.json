@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://continuity.local/schemas/v1/manifest.schema.json",
+  "title": "Continuity v1 package manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "package_id",
+    "project_id",
+    "created_at",
+    "status",
+    "readiness",
+    "allow_conditional_promotion",
+    "lineage_roots",
+    "selected_source_hashes",
+    "files"
+  ],
+  "properties": {
+    "schema": {"const": "continuity.package/v1"},
+    "package_id": {"$ref": "#/$defs/stableId"},
+    "project_id": {"$ref": "#/$defs/stableId"},
+    "created_at": {"$ref": "#/$defs/timestamp"},
+    "successor_created_at": {"$ref": "#/$defs/timestamp"},
+    "status": {"$ref": "#/$defs/packageStatus"},
+    "readiness": {"$ref": "#/$defs/readinessStatus"},
+    "allow_conditional_promotion": {"type": "boolean"},
+    "predecessor_package_id": {"$ref": "#/$defs/stableId"},
+    "lineage_roots": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/stableId"},
+      "uniqueItems": true
+    },
+    "selected_source_hashes": {"$ref": "#/$defs/sourceHashes"},
+    "files": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/fileRecord"},
+      "uniqueItems": true
+    },
+    "extensions": {"$ref": "#/$defs/extensions"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"enum": ["Canonical", "Superseded"]}},
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["predecessor_package_id", "successor_created_at"]
+      }
+    }
+  ],
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "packageStatus": {
+      "type": "string",
+      "enum": ["Candidate", "Blocked", "Canonical", "Superseded"]
+    },
+    "readinessStatus": {
+      "type": "string",
+      "enum": ["Ready", "Conditional", "Blocked"]
+    },
+    "sourceHashes": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/stableId"},
+      "additionalProperties": {"$ref": "#/$defs/digest"}
+    },
+    "fileRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size_bytes"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
+          "not": {"enum": ["MANIFEST.json", "SHA256SUMS.txt"]}
+        },
+        "sha256": {"$ref": "#/$defs/digest"},
+        "size_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "extensions": {"type": "object", "additionalProperties": true}
+  }
+}

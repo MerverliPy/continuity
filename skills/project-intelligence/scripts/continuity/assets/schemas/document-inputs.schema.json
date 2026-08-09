@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://continuity.local/schemas/v1/document-inputs.schema.json",
+  "title": "Continuity v1 document rendering inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "supplemental_narrative"],
+  "properties": {
+    "schema": {"const": "continuity.document-inputs/v1"},
+    "supplemental_narrative": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "HANDOFF_README.md",
+        "CANONICAL_STATE.md",
+        "AUTHORITY_LEDGER.md",
+        "CONFLICT_RESOLUTIONS.md",
+        "UNRESOLVED.md",
+        "NEXT_THREAD_PROMPT.txt",
+        "SUPERPOWERS_PREFLIGHT.md"
+      ],
+      "properties": {
+        "HANDOFF_README.md": {"type": "string", "minLength": 1},
+        "CANONICAL_STATE.md": {"type": "string", "minLength": 1},
+        "AUTHORITY_LEDGER.md": {"type": "string", "minLength": 1},
+        "CONFLICT_RESOLUTIONS.md": {"type": "string", "minLength": 1},
+        "UNRESOLVED.md": {"type": "string", "minLength": 1},
+        "NEXT_THREAD_PROMPT.txt": {"type": "string", "minLength": 1},
+        "SUPERPOWERS_PREFLIGHT.md": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+continuity = "continuity.cli:main"
+
 [project.optional-dependencies]
 test = [
     "pytest>=8,<9",
@@ -19,6 +22,13 @@ test = [
 [tool.setuptools.packages.find]
 where = ["skills/project-intelligence/scripts"]
 include = ["continuity*"]
+
+[tool.setuptools.package-data]
+continuity = [
+    "assets/schemas/*.json",
+    "assets/templates/*.md",
+    "assets/templates/*.txt",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

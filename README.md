@@ -4,9 +4,11 @@ Continuity is a skills-first ChatGPT and Codex plugin for preservation-first pro
 
 Version 1 operates on files available in the active workspace. Original evidence stays read-only, timestamps never establish authority by themselves, and no unsupported claim is upgraded to verified fact.
 
-## Install and package layout
+## Plugin bundle and local Python distribution
 
-Keep the repository layout intact when installing or packaging the plugin. `.codex-plugin/plugin.json` declares the plugin and `skills/` contains the five skill entry points. The deterministic Python package, schemas, templates, and operator references are bundled under `skills/project-intelligence/` so they resolve after installation.
+ChatGPT or Codex plugin installation uses the plugin bundle: `.codex-plugin/plugin.json` and the `skills/` layout. A Python wheel does not install ChatGPT skills.
+
+The local `continuity` Python distribution supplies the deterministic CLI/runtime. Its wheel contains the executable code plus the six JSON schemas and seven rendering templates needed for validation and packaging. The plugin bundle retains the same assets at `skills/project-intelligence/assets/`; the distribution copies are contract-tested byte-for-byte against them.
 
 ```text
 .codex-plugin/plugin.json
@@ -30,10 +32,17 @@ Use the official OpenAI plugin flow for the host where Continuity will run:
 - [Build skills](https://developers.openai.com/plugins/build/skills)
 - [Connect from ChatGPT](https://developers.openai.com/plugins/deploy/connect-chatgpt)
 
-The runtime package supports Python 3.11 or newer and uses only the standard library. From a checkout, invoke the bundled CLI directly:
+The runtime package supports Python 3.11 or newer and uses only the standard library. From a checkout, invoke the plugin-bundle wrapper directly:
 
 ```bash
 python skills/project-intelligence/scripts/continuity_cli.py --help
+```
+
+For local CLI/runtime use outside the checkout, install the wheel and invoke its console command:
+
+```bash
+python -m pip install .
+continuity --help
 ```
 
 For development tests, install the test-only dependencies in an isolated environment:

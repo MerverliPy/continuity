@@ -37,6 +37,7 @@ from .reconciliation import (
 )
 from .redaction import redact_text
 from .readiness import classify_readiness
+from .resources import read_asset_text
 
 
 _DOCUMENT_PATHS = (
@@ -73,16 +74,14 @@ _RFC3339 = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
-_ASSETS_ROOT = Path(__file__).resolve().parents[2] / "assets"
-_SCHEMA_PATHS = {
-    "manifest": _ASSETS_ROOT / "schemas/manifest.schema.json",
-    "lineage": _ASSETS_ROOT / "schemas/lineage.schema.json",
-    "evidence": _ASSETS_ROOT / "schemas/evidence-index.schema.json",
-    "reconciliation": _ASSETS_ROOT / "schemas/reconciliation.schema.json",
-    "preflight": _ASSETS_ROOT / "schemas/preflight.schema.json",
-    "document-inputs": _ASSETS_ROOT / "schemas/document-inputs.schema.json",
+_SCHEMA_FILES = {
+    "manifest": "manifest.schema.json",
+    "lineage": "lineage.schema.json",
+    "evidence": "evidence-index.schema.json",
+    "reconciliation": "reconciliation.schema.json",
+    "preflight": "preflight.schema.json",
+    "document-inputs": "document-inputs.schema.json",
 }
-_TEMPLATE_ROOT = _ASSETS_ROOT / "templates"
 _TEMPLATE_TOKEN_CONTENT = re.compile(r"\s*([a-z][a-z0-9_]*)\s*")
 _THEMATIC_BREAK = re.compile(
     r"^[ ]{0,3}(?P<marker>\*(?:[ \t]*\*){2,}|_(?:[ \t]*_){2,}|"
@@ -865,7 +864,7 @@ def _render_documents_from_structured_inputs(
     }
     rendered: dict[str, str] = {}
     for document_path in _DOCUMENT_PATHS:
-        template = _read_asset_text(_TEMPLATE_ROOT / document_path, "template")
+        template = read_asset_text("templates", document_path, "template")
         rendered[document_path] = _render_template(template, token_values[document_path])
         if not rendered[document_path].strip():
             raise ValueError(f"rendered template is empty: {document_path}")
@@ -1366,19 +1365,6 @@ def _scan_template_tokens(
     return tokens, spans
 
 
-def _read_asset_text(path: Path, label: str) -> str:
-    try:
-        mode = path.lstat().st_mode
-    except FileNotFoundError as error:
-        raise ValueError(f"bundled {label} is missing: {path.name}") from error
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise ValueError(f"bundled {label} is unsafe: {path.name}")
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise ValueError(f"bundled {label} is unreadable: {path.name}") from error
-
-
 def _validate_json_artifacts(
     root: Path,
     violations: list[str],
@@ -1507,9 +1493,10 @@ def _validate_against_schema(
     label: str,
     violations: list[str],
 ) -> None:
-    schema_path = _SCHEMA_PATHS[schema_name]
     try:
-        schema_value = json.loads(_read_asset_text(schema_path, "schema"))
+        schema_value = json.loads(
+            read_asset_text("schemas", _SCHEMA_FILES[schema_name], "schema")
+        )
     except json.JSONDecodeError:
         violations.append(f"{label} schema is not valid JSON")
         return
