@@ -103,6 +103,8 @@ _PREFLIGHT_FIELDS = frozenset(
         "evidence_references",
     }
 )
+_MAX_STRUCTURED_JSON_BYTES = 2 * 1024 * 1024
+_MAX_STRUCTURED_JSON_DEPTH = 64
 
 
 class CliInputError(ValueError):
@@ -183,7 +185,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = _error(str(error))
         _emit_best_effort(payload, output)
         return 1
-    except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+    except (
+        OSError,
+        RecursionError,
+        RuntimeError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
         payload = _error("operation failed validation or could not be completed")
         _emit_best_effort(payload, output)
         return 1
@@ -662,33 +672,52 @@ def _parse_conflict(value: Mapping[str, object]) -> ConflictRecord:
 
 
 def _read_object(path: Path, label: str) -> dict[str, object]:
-    try:
-        mode = path.lstat().st_mode
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-            raise CliInputError(f"{label} must be a regular JSON file")
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except CliInputError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise CliInputError(f"{label} could not be read as JSON") from error
+    value = _read_limited_json(path, label)
     if not isinstance(value, dict):
         raise CliInputError(f"{label} must be a JSON object")
     return value
 
 
 def _read_object_list(path: Path, label: str) -> tuple[dict[str, object], ...]:
+    value = _read_limited_json(path, label)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise CliInputError(f"{label} must be a JSON list of objects")
+    return tuple(value)
+
+
+def _read_limited_json(path: Path, label: str) -> object:
+    """Read untrusted CLI JSON behind byte and iterative nesting gates."""
+
     try:
         mode = path.lstat().st_mode
         if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
             raise CliInputError(f"{label} must be a regular JSON file")
-        value = json.loads(path.read_text(encoding="utf-8"))
+        if path.stat(follow_symlinks=False).st_size > _MAX_STRUCTURED_JSON_BYTES:
+            raise CliInputError(f"{label} exceeds structured JSON size limit")
+        raw = path.read_bytes()
+        if len(raw) > _MAX_STRUCTURED_JSON_BYTES:
+            raise CliInputError(f"{label} exceeds structured JSON size limit")
+        value = json.loads(raw.decode("utf-8"))
     except CliInputError:
         raise
+    except RecursionError as error:
+        raise CliInputError(f"{label} exceeds structured JSON nesting limit") from error
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise CliInputError(f"{label} could not be read as JSON") from error
-    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
-        raise CliInputError(f"{label} must be a JSON list of objects")
-    return tuple(value)
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if not isinstance(current, (dict, list)):
+            continue
+        if depth > _MAX_STRUCTURED_JSON_DEPTH:
+            raise CliInputError(f"{label} exceeds structured JSON nesting limit")
+        children = current.values() if isinstance(current, dict) else current
+        stack.extend(
+            (child, depth + 1)
+            for child in children
+            if isinstance(child, (dict, list))
+        )
+    return value
 
 
 def _exact_fields(value: Mapping[str, object], expected: frozenset[str], label: str) -> None:

@@ -133,6 +133,20 @@ def _resolved_report() -> ReconciliationReport:
     )
 
 
+def _report_with_approvals(
+    *approvals: ApprovalRecord,
+) -> ReconciliationReport:
+    report = _report()
+    return ReconciliationReport(
+        claims=report.claims,
+        approvals=(*report.approvals, *approvals),
+        findings=report.findings,
+        conflicts=report.conflicts,
+        selected_claim_ids=report.selected_claim_ids,
+        notes=report.notes,
+    )
+
+
 def _forged_database_report() -> ReconciliationReport:
     """Return the exact omitted-conflict reviewer reproduction."""
     report = _report()
@@ -179,7 +193,10 @@ def _request(
     source_zip = tmp_path / "input.zip"
     if not source_zip.exists():
         with zipfile.ZipFile(source_zip, "w") as archive:
-            archive.writestr("proof.txt", "immutable evidence\n")
+            archive.writestr(
+                zipfile.ZipInfo("proof.txt", date_time=FIXED_ZIP_TIMESTAMP),
+                "immutable evidence\n",
+            )
     selected_report = report or _report()
     if readiness is ReadinessStatus.CONDITIONAL and report is None:
         condition = ClaimRecord(
@@ -302,6 +319,26 @@ def _regenerate_integrity(root: Path) -> None:
         successor_created_at=manifest.get("successor_created_at"),
     )
     write_sha256s(root, checksum_path)
+
+
+def _promoted_package(tmp_path: Path):
+    candidate = build_candidate(_request(tmp_path))
+    return promote_candidate(
+        candidate.root,
+        tmp_path / "canonical-alpha",
+        _approval(candidate.package_id),
+        "2026-08-09T14:00:00Z",
+    )
+
+
+def _write_nested_extension(path: Path, depth: int) -> None:
+    text = path.read_text(encoding="utf-8").rstrip()
+    assert text.endswith("}")
+    nested = "[" * depth + "0" + "]" * depth
+    path.write_text(
+        text[:-1] + ',"extensions":{"deep":' + nested + "}}",
+        encoding="utf-8",
+    )
 
 
 def test_template_renderer_rejects_missing_and_unused_tokens() -> None:
@@ -845,6 +882,75 @@ def test_hostile_structured_records_return_stable_invalid_validation(
     )
 
 
+def test_overdeep_structured_json_is_rejected_before_schema_traversal(tmp_path: Path) -> None:
+    """Catches schema traversal accepting JSON beyond the conservative depth gate."""
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    _write_nested_extension(receipt_path, 80)
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("nesting limit" in item for item in validation.violations)
+
+
+def test_parser_recursion_input_returns_stable_invalid_validation(tmp_path: Path) -> None:
+    """Catches RecursionError escaping the public package validation boundary."""
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    _write_nested_extension(receipt_path, 2_000)
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert validation.violations == (
+        "required JSON artifact exceeds nesting limit: receipts/RECONCILIATION.json",
+    ) or any("nesting limit" in item for item in validation.violations)
+
+
+def test_oversized_structured_json_is_rejected_before_semantic_validation(
+    tmp_path: Path,
+) -> None:
+    """Catches a large schema extension consuming unbounded package validation memory."""
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["extensions"] = {"blob": "x" * (4 * 1024 * 1024)}
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("size limit" in item for item in validation.violations)
+
+
+def test_cli_validate_handles_recursive_json_without_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Catches hostile package JSON escaping the CLI error boundary as RecursionError."""
+    from continuity import cli
+
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    _write_nested_extension(receipt_path, 2_000)
+    _regenerate_integrity(result.root)
+    output = tmp_path / "recursive-validation.json"
+
+    code = cli.main(
+        ["validate", str(result.release), "--output", str(output)]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err == ""
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["ok"] is False
+    assert payload["validation"]["valid"] is False
+
+
 def test_nested_schema_extension_is_rejected_before_publication(tmp_path: Path) -> None:
     """Catches undeclared nested evidence fields crossing the construction boundary."""
     request = _request(tmp_path)
@@ -1303,11 +1409,44 @@ def test_secret_bearing_file_requires_path_specific_secure_handling_approval(tmp
     result = build_candidate(
         _request(
             tmp_path,
+            report=_report_with_approvals(exact),
             canonical_files={"secrets.env": secret},
             secure_handling_approvals=(exact,),
         )
     )
     assert (result.root / "canonical/secrets.env").read_bytes() == secret.read_bytes()
+    reconciliation = json.loads(
+        (result.root / "receipts/RECONCILIATION.json").read_text(encoding="utf-8")
+    )
+    assert any(
+        approval["approval_id"] == exact.approval_id
+        and approval["source_ref"] == exact.source_ref
+        for approval in reconciliation["approvals"]
+    )
+
+
+def test_secret_approval_must_be_portable_reconciliation_authority(tmp_path: Path) -> None:
+    """Catches construction-only secret permission absent from checksummed authority."""
+    secret = tmp_path / "secrets.env"
+    secret.write_text("API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8")
+    exact = ApprovalRecord(
+        "approval-secret-exact",
+        "secure-handling",
+        ("canonical/secrets.env",),
+        "approved",
+        "user",
+        "conversation://approval/43",
+        "2026-08-09T11:30:00Z",
+    )
+
+    with pytest.raises(ValueError, match="reconciliation authority"):
+        build_candidate(
+            _request(
+                tmp_path,
+                canonical_files={"secrets.env": secret},
+                secure_handling_approvals=(exact,),
+            )
+        )
 
 
 def test_secure_handling_approval_must_enumerate_each_secret_path(tmp_path: Path) -> None:
@@ -1316,26 +1455,135 @@ def test_secure_handling_approval_must_enumerate_each_secret_path(tmp_path: Path
     second = tmp_path / "second.env"
     first.write_text("API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8")
     second.write_text("PASSWORD=highly-sensitive-password\n", encoding="utf-8")
-    enumerated = ApprovalRecord(
-        "approval-secret-enumerated",
+    first_approval = ApprovalRecord(
+        "approval-secret-first",
         "secure-handling",
-        ("canonical/first.env", "canonical/second.env"),
+        ("canonical/first.env",),
         "approved",
         "user",
-        "conversation://approval/44",
+        "conversation://approval/first",
         "2026-08-09T11:45:00Z",
+    )
+    second_approval = ApprovalRecord(
+        "approval-secret-second",
+        "secure-handling",
+        ("canonical/second.env",),
+        "approved",
+        "user",
+        "conversation://approval/second",
+        "2026-08-09T11:46:00Z",
     )
 
     result = build_candidate(
         _request(
             tmp_path,
+            report=_report_with_approvals(first_approval, second_approval),
             canonical_files={"first.env": first, "second.env": second},
-            secure_handling_approvals=(enumerated,),
+            secure_handling_approvals=(first_approval, second_approval),
         )
     )
 
     assert (result.root / "canonical/first.env").read_bytes() == first.read_bytes()
     assert (result.root / "canonical/second.env").read_bytes() == second.read_bytes()
+
+
+def test_independent_validation_rescans_canonical_secret_text(tmp_path: Path) -> None:
+    """Catches checksummed secret injection without portable secure authority."""
+    result = build_candidate(_request(tmp_path))
+    (result.root / "canonical/src/app.py").write_text(
+        "API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8"
+    )
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("secret authority" in item for item in validation.violations)
+
+
+def test_independent_validation_rejects_removed_secret_approval(tmp_path: Path) -> None:
+    """Catches portable secret bytes outliving their checksummed approval provenance."""
+    secret = tmp_path / "secrets.env"
+    secret.write_text("API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8")
+    exact = ApprovalRecord(
+        "approval-secret-exact",
+        "secure-handling",
+        ("canonical/secrets.env",),
+        "approved",
+        "user",
+        "conversation://approval/43",
+        "2026-08-09T11:30:00Z",
+    )
+    result = build_candidate(
+        _request(
+            tmp_path,
+            report=_report_with_approvals(exact),
+            canonical_files={"secrets.env": secret},
+            secure_handling_approvals=(exact,),
+        )
+    )
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["approvals"] = [
+        item for item in receipt["approvals"] if item["approval_id"] != exact.approval_id
+    ]
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("secret authority" in item for item in validation.violations)
+
+
+def test_independent_validation_rejects_tampered_secret_approval(tmp_path: Path) -> None:
+    """Catches checksummed approval provenance being blanked after construction."""
+    secret = tmp_path / "secrets.env"
+    secret.write_text("API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8")
+    exact = ApprovalRecord(
+        "approval-secret-exact",
+        "secure-handling",
+        ("canonical/secrets.env",),
+        "approved",
+        "user",
+        "conversation://approval/43",
+        "2026-08-09T11:30:00Z",
+    )
+    result = build_candidate(
+        _request(
+            tmp_path,
+            report=_report_with_approvals(exact),
+            canonical_files={"secrets.env": secret},
+            secure_handling_approvals=(exact,),
+        )
+    )
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    secret_approval = next(
+        item
+        for item in receipt["approvals"]
+        if item["approval_id"] == exact.approval_id
+    )
+    secret_approval["source_ref"] = ""
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("secret authority" in item for item in validation.violations)
+
+
+def test_binary_canonical_file_uses_same_secret_scan_boundary(tmp_path: Path) -> None:
+    """Catches validation interpreting undecodable binary differently from construction."""
+    binary = tmp_path / "asset.bin"
+    binary.write_bytes(b"\xff\xfeAPI_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\x00")
+
+    result = build_candidate(
+        _request(tmp_path, canonical_files={"asset.bin": binary})
+    )
+
+    assert validate_package(result.root).valid
 
 
 @pytest.mark.parametrize(
@@ -1691,6 +1939,57 @@ def test_promotion_is_append_only_and_regenerates_integrity_artifacts(tmp_path: 
     assert _package_snapshot(candidate.root) == candidate_before
     assert candidate.zip_path.read_bytes() == candidate_zip_before
     assert canonical.zip_path.read_bytes() != candidate.zip_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "promotion-candidate-and-scope",
+        "manifest-predecessor",
+        "lineage-parent",
+        "extra-lineage-parent",
+        "self-parent",
+    ),
+)
+def test_canonical_ancestry_is_cross_bound_across_all_authority_records(
+    tmp_path: Path, tamper: str
+) -> None:
+    """Catches internally plausible authority records naming different ancestry."""
+    canonical = _promoted_package(tmp_path)
+    manifest_path = canonical.root / "MANIFEST.json"
+    lineage_path = canonical.root / "lineage/LINEAGE.json"
+    promotion_path = canonical.root / "receipts/PROMOTION.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    promotion = json.loads(promotion_path.read_text(encoding="utf-8"))
+    if tamper == "promotion-candidate-and-scope":
+        promotion["candidate_package_id"] = "other-candidate"
+        promotion["approval"]["scope"] = ["other-candidate"]
+        promotion_path.write_text(json.dumps(promotion), encoding="utf-8")
+    elif tamper == "manifest-predecessor":
+        manifest["predecessor_package_id"] = "other-candidate"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif tamper == "lineage-parent":
+        lineage["parent_ids"] = ["other-candidate"]
+        lineage_path.write_text(json.dumps(lineage), encoding="utf-8")
+    elif tamper == "extra-lineage-parent":
+        lineage["parent_ids"].append("other-candidate")
+        lineage_path.write_text(json.dumps(lineage), encoding="utf-8")
+    else:
+        successor_id = manifest["package_id"]
+        manifest["predecessor_package_id"] = successor_id
+        lineage["parent_ids"] = [successor_id]
+        promotion["candidate_package_id"] = successor_id
+        promotion["approval"]["scope"] = [successor_id]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        lineage_path.write_text(json.dumps(lineage), encoding="utf-8")
+        promotion_path.write_text(json.dumps(promotion), encoding="utf-8")
+    _regenerate_integrity(canonical.root)
+
+    validation = validate_package(canonical.root)
+
+    assert not validation.valid
+    assert any("canonical ancestry" in item for item in validation.violations)
 
 
 def test_conditional_candidate_requires_explicit_build_permission_to_promote(

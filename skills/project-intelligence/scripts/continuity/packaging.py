@@ -66,6 +66,8 @@ _ALLOWED_ROOT_ENTRIES = frozenset(
 )
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _CHUNK_SIZE = 1024 * 1024
+_MAX_STRUCTURED_JSON_BYTES = 2 * 1024 * 1024
+_MAX_STRUCTURED_JSON_DEPTH = 64
 _APPROVED_DECISIONS = frozenset({"allow", "allowed", "approve", "approved"})
 _RFC3339 = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
@@ -241,7 +243,7 @@ def validate_package(root: Path) -> PackageValidation:
 
     try:
         return _validate_package(Path(root))
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, RecursionError, TypeError, ValueError):
         return PackageValidation(
             False,
             ("package structured validation failed",),
@@ -427,12 +429,20 @@ def _validate_package(root: Path) -> PackageValidation:
                 "lineage successor_created_at does not match manifest successor_created_at"
             )
 
+    promotion: dict[str, object] | None = None
     if status is PackageStatus.CANONICAL:
         promotion = _read_json_object(
             root / "receipts/PROMOTION.json", "receipts/PROMOTION.json", violations
         )
         if promotion is not None:
             _validate_promotion_receipt(promotion, package_id, violations)
+        if manifest is not None and lineage is not None:
+            _validate_canonical_ancestry(
+                manifest, lineage, promotion, package_id, violations
+            )
+
+    if reconciliation is not None:
+        _validate_canonical_secret_authority(root, reconciliation, violations)
 
     if (
         structured_artifacts_are_valid
@@ -660,6 +670,15 @@ def _validate_request(request: CandidateBuildRequest) -> None:
     )
     if reconciliation_violations:
         raise ValueError(reconciliation_violations[0])
+    reconciliation_approvals = request.approved_reconciliation_report.approvals
+    for approval in request.secure_handling_approvals:
+        if (
+            not isinstance(approval, ApprovalRecord)
+            or approval not in reconciliation_approvals
+        ):
+            raise ValueError(
+                "secure-handling approval must be identical reconciliation authority"
+            )
     effective_readiness = (
         ReadinessStatus.BLOCKED
         if request.approved_reconciliation_report.blocking_conflicts
@@ -692,6 +711,8 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         ),
     ):
         schema_violations: list[str] = []
+        if not _validate_json_value_limits(artifact, label, schema_violations):
+            raise ValueError(schema_violations[0])
         _validate_against_schema(artifact, schema_name, label, schema_violations)
         if schema_violations:
             raise ValueError(schema_violations[0])
@@ -1794,8 +1815,8 @@ def _require_secret_approval(
         and bool(approval.source_id.strip())
         and bool(approval.source_ref.strip())
         and _is_rfc3339(approval.approved_at)
-        and approved_path in approval.scope
-        and all(_is_exact_normalized_package_path(path) for path in approval.scope)
+        and approval.scope == (approved_path,)
+        and _is_exact_normalized_package_path(approved_path)
         for approval in approvals
     )
     if not exact:
@@ -2032,14 +2053,67 @@ def _read_json_object(
         violations.append(f"required JSON artifact is absent or unsafe: {display_path}")
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        if path.stat(follow_symlinks=False).st_size > _MAX_STRUCTURED_JSON_BYTES:
+            violations.append(
+                f"required JSON artifact exceeds size limit: {display_path}"
+            )
+            return None
+        raw = path.read_bytes()
+        if len(raw) > _MAX_STRUCTURED_JSON_BYTES:
+            violations.append(
+                f"required JSON artifact exceeds size limit: {display_path}"
+            )
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except RecursionError:
+        violations.append(
+            f"required JSON artifact exceeds nesting limit: {display_path}"
+        )
+        return None
     except (OSError, UnicodeError, json.JSONDecodeError):
         violations.append(f"required JSON artifact is invalid: {display_path}")
+        return None
+    if not _validate_json_value_limits(value, display_path, violations, required=True):
         return None
     if not isinstance(value, dict):
         violations.append(f"required JSON artifact must be an object: {display_path}")
         return None
     return value
+
+
+def _validate_json_value_limits(
+    value: object,
+    label: str,
+    violations: list[str],
+    *,
+    required: bool = False,
+) -> bool:
+    """Gate untrusted JSON iteratively before recursive semantic/schema traversal."""
+
+    prefix = "required JSON artifact" if required else "structured JSON artifact"
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if not isinstance(current, (Mapping, list)):
+            continue
+        if depth > _MAX_STRUCTURED_JSON_DEPTH:
+            violations.append(f"{prefix} exceeds nesting limit: {label}")
+            return False
+        children = current.values() if isinstance(current, Mapping) else current
+        stack.extend(
+            (child, depth + 1)
+            for child in children
+            if isinstance(child, (Mapping, list))
+        )
+    try:
+        encoded_size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    except (RecursionError, TypeError, ValueError):
+        violations.append(f"{prefix} is not valid JSON: {label}")
+        return False
+    if encoded_size > _MAX_STRUCTURED_JSON_BYTES:
+        violations.append(f"{prefix} exceeds size limit: {label}")
+        return False
+    return True
 
 
 def _write_json_new(path: Path, value: Mapping[str, object]) -> None:
@@ -2461,6 +2535,112 @@ def _validate_promotion_receipt(
         approval["decision"]
     ) not in _APPROVED_DECISIONS:
         violations.append("promotion approval decision is invalid")
+
+
+def _validate_canonical_ancestry(
+    manifest: Mapping[str, object],
+    lineage: Mapping[str, object],
+    promotion: Mapping[str, object] | None,
+    package_id: str | None,
+    violations: list[str],
+) -> None:
+    """Cross-bind every canonical direct-ancestry authority record."""
+
+    predecessor = manifest.get("predecessor_package_id")
+    if not isinstance(predecessor, str) or not predecessor.strip():
+        violations.append("canonical ancestry predecessor must be non-empty")
+        return
+    if predecessor == package_id:
+        violations.append("canonical ancestry cannot be self-parented")
+    if lineage.get("parent_ids") != [predecessor]:
+        violations.append(
+            "canonical ancestry lineage parent_ids must equal the manifest predecessor"
+        )
+    if promotion is None:
+        violations.append("canonical ancestry promotion receipt is missing")
+        return
+    if promotion.get("candidate_package_id") != predecessor:
+        violations.append(
+            "canonical ancestry promotion candidate must equal the manifest predecessor"
+        )
+    if promotion.get("canonical_package_id") != package_id:
+        violations.append(
+            "canonical ancestry promotion successor must equal the manifest package_id"
+        )
+    approval = promotion.get("approval")
+    if not isinstance(approval, Mapping):
+        violations.append("canonical ancestry promotion approval must be an object")
+        return
+    if (
+        approval.get("action") != "promote-candidate"
+        or approval.get("scope") != [predecessor]
+        or not isinstance(approval.get("decision"), str)
+        or _normalize(approval["decision"]) not in _APPROVED_DECISIONS
+    ):
+        violations.append(
+            "canonical ancestry promotion approval must exactly authorize the predecessor"
+        )
+
+
+def _validate_canonical_secret_authority(
+    root: Path,
+    reconciliation: Mapping[str, object],
+    violations: list[str],
+) -> None:
+    """Rescan portable canonical text and require checksummed exact authority."""
+
+    approvals = reconciliation.get("approvals")
+    approval_records = approvals if isinstance(approvals, list) else []
+    canonical_root = root / "canonical"
+    if not _is_regular_directory(canonical_root):
+        return
+    for directory, directories, files in os.walk(canonical_root, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in files:
+            path = Path(directory) / name
+            if not _is_regular_file(path):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            except OSError:
+                violations.append(
+                    "canonical secret authority scan could not read canonical file"
+                )
+                continue
+            if not redact_text(text).findings:
+                continue
+            relative = path.relative_to(root).as_posix()
+            if not any(
+                _is_exact_secure_approval_mapping(approval, relative)
+                for approval in approval_records
+                if isinstance(approval, Mapping)
+            ):
+                violations.append(
+                    f"canonical secret authority missing exact approval: {relative}"
+                )
+
+
+def _is_exact_secure_approval_mapping(
+    approval: Mapping[str, object], path: str
+) -> bool:
+    decision = approval.get("decision")
+    return bool(
+        approval.get("action") == "secure-handling"
+        and approval.get("scope") == [path]
+        and isinstance(decision, str)
+        and _normalize(decision) in _APPROVED_DECISIONS
+        and isinstance(approval.get("approval_id"), str)
+        and approval["approval_id"].strip()
+        and isinstance(approval.get("source_id"), str)
+        and approval["source_id"].strip()
+        and isinstance(approval.get("source_ref"), str)
+        and approval["source_ref"].strip()
+        and _is_rfc3339(approval.get("approved_at"))
+        and _is_exact_normalized_package_path(path)
+    )
 
 
 def _validate_source_hashes(value: object, label: str, violations: list[str]) -> None:

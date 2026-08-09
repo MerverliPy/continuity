@@ -1322,6 +1322,31 @@ def test_json_output_rejects_symlink_parent_redirection(
     assert not (redirected / "report.json").exists()
 
 
+def test_cli_build_rejects_overdeep_request_without_traceback(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches recursive user JSON escaping a non-validation CLI boundary."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    request = tmp_path / "recursive-request.json"
+    request.write_text(
+        '{"deep":' + "[" * 2_000 + "0" + "]" * 2_000 + "}",
+        encoding="utf-8",
+    )
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        tmp_path / "release",
+        expected=1,
+    )
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "invalid_input"
+
+
 def test_runtime_publication_failure_is_stable_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
