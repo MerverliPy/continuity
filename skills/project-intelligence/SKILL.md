@@ -20,9 +20,13 @@ Use this entry skill when a user wants to recover, inspect, reconcile, hand off,
 7. Route approved reconciliation results that need a portable successor to `create-canonical-handoff`.
 8. Route a canonical package or completed reconciliation report that needs an execution-readiness brief to `superpowers-preflight`.
 
+## Operating rules
+
+Load only the directly relevant reference files for the current route: evidence classification from `skills/project-intelligence/references/evidence-states.md` and portable lifecycle rules from `skills/project-intelligence/references/package-contract.md`. For every material claim, quote or cite the inspected file path and record ID; a route summary cannot upgrade evidence. Keep all source evidence read-only. Use the Continuity CLI for hashes, archive inspection, manifests, validation, and packaging instead of reproducing deterministic operations in prose. Pause for exactly scoped user authority when material conflicts exist. Never label a `Candidate` as `Canonical`, and never route a `Blocked` package into execution. Return a useful Continuity result even if Superpowers is absent.
+
 ## Output contract
 
-Return a routing record containing the selected project identity, observed source paths, requested outcome, scope assumptions, evidence status, and exactly one next Continuity skill. Explain why the route is appropriate without treating an asserted fact as verified.
+Return a routing record containing the selected project identity, observed source paths, requested outcome, scope assumptions, evidence status, and exactly one next Continuity skill. Explain why the route is appropriate without treating an asserted fact as verified. The record cites each material claim's inspected file path and record ID.
 
 ## Stop conditions
 

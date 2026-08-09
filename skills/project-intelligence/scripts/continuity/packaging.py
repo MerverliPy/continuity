@@ -54,6 +54,15 @@ _RFC3339 = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
+_ASSETS_ROOT = Path(__file__).resolve().parents[2] / "assets"
+_SCHEMA_PATHS = {
+    "manifest": _ASSETS_ROOT / "schemas/manifest.schema.json",
+    "lineage": _ASSETS_ROOT / "schemas/lineage.schema.json",
+    "evidence": _ASSETS_ROOT / "schemas/evidence-index.schema.json",
+    "reconciliation": _ASSETS_ROOT / "schemas/reconciliation.schema.json",
+}
+_TEMPLATE_ROOT = _ASSETS_ROOT / "templates"
+_TEMPLATE_TOKEN = re.compile(r"{{\s*([a-z][a-z0-9_]*)\s*}}")
 
 
 @dataclass(frozen=True)
@@ -120,6 +129,7 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
         if status is PackageStatus.BLOCKED
         else request.readiness
     )
+    rendered_documents = _render_documents(request, status, readiness)
     workspace = Path(
         tempfile.mkdtemp(prefix=f".{output.name}.continuity-build-", dir=output.parent)
     )
@@ -130,7 +140,7 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
         for directory in _REQUIRED_DIRECTORIES:
             (package_root / directory).mkdir()
         for path in _DOCUMENT_PATHS:
-            _write_bytes_new(package_root / path, request.rendered_documents[path].encode("utf-8"))
+            _write_bytes_new(package_root / path, rendered_documents[path].encode("utf-8"))
 
         _copy_canonical_files(
             request.canonical_files,
@@ -146,6 +156,13 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
             package_root / "receipts/RECONCILIATION.json",
             request.approved_reconciliation_report.to_dict(),
         )
+        artifact_violations: list[str] = []
+        _validate_json_artifacts(package_root, artifact_violations, include_manifest=False)
+        if artifact_violations:
+            raise ValueError(
+                "structured package artifacts are invalid: "
+                + "; ".join(artifact_violations)
+            )
         _write_manifest(
             package_root,
             package_id=request.package_id,
@@ -157,6 +174,13 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
             lineage_roots=_lineage_roots(request.lineage_data),
             allow_conditional_promotion=request.allow_conditional_promotion,
         )
+        artifact_violations = []
+        _validate_json_artifacts(package_root, artifact_violations, include_manifest=True)
+        if artifact_violations:
+            raise ValueError(
+                "structured package artifacts are invalid: "
+                + "; ".join(artifact_violations)
+            )
         write_sha256s(package_root, package_root / "SHA256SUMS.txt")
         validation = validate_package(package_root)
         if not validation.valid:
@@ -222,6 +246,14 @@ def validate_package(root: Path) -> PackageValidation:
         violations,
     )
     manifest = _read_json_object(root / "MANIFEST.json", "MANIFEST.json", violations)
+    for artifact, schema_name, label in (
+        (lineage, "lineage", "lineage"),
+        (evidence_index, "evidence", "evidence"),
+        (reconciliation, "reconciliation", "reconciliation"),
+        (manifest, "manifest", "manifest"),
+    ):
+        if artifact is not None:
+            _validate_against_schema(artifact, schema_name, label, violations)
     if manifest is not None:
         package_id = _nonempty_string(manifest.get("package_id"), "manifest package_id", violations)
         project_id = _nonempty_string(
@@ -239,6 +271,18 @@ def validate_package(root: Path) -> PackageValidation:
         _validate_string_list(manifest.get("lineage_roots"), "manifest lineage_roots", violations)
         if not isinstance(manifest.get("allow_conditional_promotion"), bool):
             violations.append("manifest allow_conditional_promotion must be boolean")
+        successor_created_at = manifest.get("successor_created_at")
+        if status in {PackageStatus.CANONICAL, PackageStatus.SUPERSEDED}:
+            _rfc3339_value(
+                successor_created_at,
+                "manifest successor_created_at",
+                violations,
+            )
+            _nonempty_string(
+                manifest.get("predecessor_package_id"),
+                "manifest predecessor_package_id",
+                violations,
+            )
         _validate_source_hashes(
             manifest.get("selected_source_hashes"),
             "manifest selected_source_hashes",
@@ -280,6 +324,10 @@ def validate_package(root: Path) -> PackageValidation:
             violations.append("lineage source hashes do not match manifest selected sources")
         if lineage.get("root_package_ids") != manifest.get("lineage_roots"):
             violations.append("lineage roots do not match manifest lineage_roots")
+        if lineage.get("successor_created_at") != manifest.get("successor_created_at"):
+            violations.append(
+                "lineage successor_created_at does not match manifest successor_created_at"
+            )
 
     if status is PackageStatus.CANONICAL:
         promotion = _read_json_object(
@@ -368,6 +416,14 @@ def promote_candidate(
             successor_created_at,
             validation.readiness,
         )
+        _update_successor_handoff(
+            successor_root / "HANDOFF_README.md",
+            candidate_id=validation.package_id,
+            successor_id=successor_id,
+            candidate_created_at=str(manifest["created_at"]),
+            successor_created_at=successor_created_at,
+            readiness=validation.readiness,
+        )
         successor_lineage = json.loads(
             (successor_root / "lineage/LINEAGE.json").read_text(encoding="utf-8")
         )
@@ -382,7 +438,15 @@ def promote_candidate(
             lineage_roots=_lineage_roots(successor_lineage),
             allow_conditional_promotion=conditional_allowed,
             predecessor_package_id=validation.package_id,
+            successor_created_at=successor_created_at,
         )
+        artifact_violations: list[str] = []
+        _validate_json_artifacts(successor_root, artifact_violations, include_manifest=True)
+        if artifact_violations:
+            raise ValueError(
+                "promoted structured artifacts are invalid: "
+                + "; ".join(artifact_violations)
+            )
         write_sha256s(successor_root, successor_root / "SHA256SUMS.txt")
         successor_validation = validate_package(successor_root)
         if not successor_validation.valid:
@@ -432,6 +496,8 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         raise ValueError("lineage data and evidence index must be objects")
     if request.lineage_data.get("source_hashes") != dict(request.selected_source_hashes):
         raise ValueError("lineage source hashes must match selected source hashes")
+    if request.lineage_data.get("status") != PackageStatus.CANDIDATE.value:
+        raise ValueError("lineage status must be Candidate in a build request")
     lineage_violations: list[str] = []
     _validate_lineage_structure(request.lineage_data, lineage_violations)
     if request.lineage_data.get("package_id") != request.package_id:
@@ -440,8 +506,6 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         lineage_violations.append("lineage project_id must match request project_id")
     if request.lineage_data.get("created_at") != request.created_at:
         lineage_violations.append("lineage created_at must match request created_at")
-    if request.lineage_data.get("status") != PackageStatus.CANDIDATE.value:
-        lineage_violations.append("lineage status must be Candidate in a build request")
     if request.lineage_data.get("readiness") != request.readiness.value:
         lineage_violations.append("lineage readiness must match request readiness")
     if lineage_violations:
@@ -467,6 +531,313 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         json.dumps(reconciliation)
     except (TypeError, ValueError) as error:
         raise ValueError("structured package inputs must be JSON serializable") from error
+    for artifact, schema_name, label in (
+        (request.lineage_data, "lineage", "lineage"),
+        (request.evidence_index, "evidence", "evidence"),
+        (reconciliation, "reconciliation", "reconciliation"),
+    ):
+        schema_violations: list[str] = []
+        _validate_against_schema(artifact, schema_name, label, schema_violations)
+        if schema_violations:
+            raise ValueError(schema_violations[0])
+
+
+def _render_documents(
+    request: CandidateBuildRequest,
+    status: PackageStatus,
+    readiness: ReadinessStatus,
+) -> dict[str, str]:
+    token_values = {
+        "HANDOFF_README.md": {
+            "package_id": request.package_id,
+            "project_id": request.project_id,
+            "created_at": request.created_at,
+            "status": status.value,
+            "readiness": readiness.value,
+            "handoff_body": request.rendered_documents["HANDOFF_README.md"],
+        },
+        "CANONICAL_STATE.md": {
+            "canonical_state": request.rendered_documents["CANONICAL_STATE.md"]
+        },
+        "AUTHORITY_LEDGER.md": {
+            "authority_records": request.rendered_documents["AUTHORITY_LEDGER.md"]
+        },
+        "CONFLICT_RESOLUTIONS.md": {
+            "conflict_resolutions": request.rendered_documents[
+                "CONFLICT_RESOLUTIONS.md"
+            ]
+        },
+        "UNRESOLVED.md": {
+            "unresolved_records": request.rendered_documents["UNRESOLVED.md"]
+        },
+        "NEXT_THREAD_PROMPT.txt": {
+            "next_thread_prompt": request.rendered_documents["NEXT_THREAD_PROMPT.txt"]
+        },
+        "SUPERPOWERS_PREFLIGHT.md": {
+            "preflight_body": request.rendered_documents["SUPERPOWERS_PREFLIGHT.md"]
+        },
+    }
+    rendered: dict[str, str] = {}
+    for document_path in _DOCUMENT_PATHS:
+        template = _read_asset_text(_TEMPLATE_ROOT / document_path, "template")
+        rendered[document_path] = _render_template(template, token_values[document_path])
+        if not rendered[document_path].strip():
+            raise ValueError(f"rendered template is empty: {document_path}")
+    return rendered
+
+
+def _render_template(template: str, values: Mapping[str, str]) -> str:
+    """Render one explicit-token template and reject incomplete token contracts."""
+
+    if not isinstance(template, str):
+        raise ValueError("template must be text")
+    if not isinstance(values, Mapping) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in values.items()
+    ):
+        raise ValueError("template values must map token names to text")
+    tokens = set(_TEMPLATE_TOKEN.findall(template))
+    syntax_remainder = _TEMPLATE_TOKEN.sub("", template)
+    if "{{" in syntax_remainder or "}}" in syntax_remainder:
+        raise ValueError("template contains invalid token syntax")
+    missing = sorted(tokens - set(values))
+    unused = sorted(set(values) - tokens)
+    if missing:
+        raise ValueError("missing template tokens: " + ", ".join(missing))
+    if unused:
+        raise ValueError("unused template tokens: " + ", ".join(unused))
+    return _TEMPLATE_TOKEN.sub(lambda match: values[match.group(1)], template)
+
+
+def _read_asset_text(path: Path, label: str) -> str:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as error:
+        raise ValueError(f"bundled {label} is missing: {path.name}") from error
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise ValueError(f"bundled {label} is unsafe: {path.name}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"bundled {label} is unreadable: {path.name}") from error
+
+
+def _validate_json_artifacts(
+    root: Path,
+    violations: list[str],
+    *,
+    include_manifest: bool,
+) -> None:
+    artifacts = [
+        ("lineage/LINEAGE.json", "lineage", "lineage"),
+        ("evidence/INDEX.json", "evidence", "evidence"),
+        ("receipts/RECONCILIATION.json", "reconciliation", "reconciliation"),
+    ]
+    if include_manifest:
+        artifacts.append(("MANIFEST.json", "manifest", "manifest"))
+    for relative, schema_name, label in artifacts:
+        value = _read_json_object(root / relative, relative, violations)
+        if value is not None:
+            _validate_against_schema(value, schema_name, label, violations)
+
+
+def _validate_against_schema(
+    instance: object,
+    schema_name: str,
+    label: str,
+    violations: list[str],
+) -> None:
+    schema_path = _SCHEMA_PATHS[schema_name]
+    try:
+        schema_value = json.loads(_read_asset_text(schema_path, "schema"))
+    except json.JSONDecodeError:
+        violations.append(f"{label} schema is not valid JSON")
+        return
+    if not isinstance(schema_value, dict):
+        violations.append(f"{label} schema root must be an object")
+        return
+    schema_violations: list[str] = []
+    _validate_schema_node(instance, schema_value, schema_value, "$", schema_violations)
+    violations.extend(f"{label} schema violation: {item}" for item in schema_violations)
+
+
+def _validate_schema_node(
+    instance: object,
+    schema: object,
+    root_schema: Mapping[str, object],
+    path: str,
+    violations: list[str],
+) -> None:
+    if schema is True:
+        return
+    if schema is False:
+        violations.append(f"{path} is prohibited")
+        return
+    if not isinstance(schema, Mapping):
+        violations.append(f"{path} has an invalid bundled schema rule")
+        return
+
+    reference = schema.get("$ref")
+    if reference is not None:
+        target = _local_schema_reference(root_schema, reference)
+        if target is None:
+            violations.append(f"{path} uses an unresolved bundled schema reference")
+            return
+        _validate_schema_node(instance, target, root_schema, path, violations)
+
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list):
+        if not any(
+            not _schema_branch_violations(instance, branch, root_schema, path)
+            for branch in any_of
+        ):
+            violations.append(f"{path} does not match any allowed schema shape")
+        return
+
+    expected_type = schema.get("type")
+    if expected_type is not None and not _matches_json_type(instance, expected_type):
+        violations.append(f"{path} has the wrong JSON type")
+        return
+    if "const" in schema and instance != schema["const"]:
+        violations.append(f"{path} does not match the required constant")
+    enum = schema.get("enum")
+    if isinstance(enum, list) and instance not in enum:
+        violations.append(f"{path} is not an allowed value")
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        for branch in all_of:
+            _validate_schema_node(instance, branch, root_schema, path, violations)
+    condition = schema.get("if")
+    if condition is not None:
+        condition_matches = not _schema_branch_violations(
+            instance, condition, root_schema, path
+        )
+        selected = schema.get("then") if condition_matches else schema.get("else")
+        if selected is not None:
+            _validate_schema_node(instance, selected, root_schema, path, violations)
+    if "not" in schema and not _schema_branch_violations(
+        instance, schema["not"], root_schema, path
+    ):
+        violations.append(f"{path} matches a prohibited schema shape")
+
+    if isinstance(instance, Mapping):
+        minimum_properties = schema.get("minProperties")
+        if isinstance(minimum_properties, int) and len(instance) < minimum_properties:
+            violations.append(f"{path} has too few properties")
+        required = schema.get("required")
+        if isinstance(required, list):
+            missing = sorted(
+                name for name in required if isinstance(name, str) and name not in instance
+            )
+            if missing:
+                violations.append(f"{path} is missing required fields: {', '.join(missing)}")
+        properties = schema.get("properties")
+        declared = properties if isinstance(properties, Mapping) else {}
+        for name, child_schema in declared.items():
+            if name in instance:
+                _validate_schema_node(
+                    instance[name], child_schema, root_schema, f"{path}.{name}", violations
+                )
+        property_names = schema.get("propertyNames")
+        if property_names is not None:
+            for name in instance:
+                _validate_schema_node(
+                    name, property_names, root_schema, f"{path}.<property>", violations
+                )
+        undeclared = sorted(str(name) for name in set(instance) - set(declared))
+        additional = schema.get("additionalProperties", True)
+        if additional is False and undeclared:
+            violations.append(f"{path} has undeclared fields: {', '.join(undeclared)}")
+        elif isinstance(additional, Mapping) or isinstance(additional, bool):
+            if additional is not True and additional is not False:
+                for name in set(instance) - set(declared):
+                    _validate_schema_node(
+                        instance[name],
+                        additional,
+                        root_schema,
+                        f"{path}.{name}",
+                        violations,
+                    )
+
+    if isinstance(instance, list):
+        minimum_items = schema.get("minItems")
+        if isinstance(minimum_items, int) and len(instance) < minimum_items:
+            violations.append(f"{path} has too few items")
+        if schema.get("uniqueItems") is True:
+            serialized = [
+                json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for item in instance
+            ]
+            if len(serialized) != len(set(serialized)):
+                violations.append(f"{path} contains duplicate items")
+        item_schema = schema.get("items")
+        if item_schema is not None:
+            for index, item in enumerate(instance):
+                _validate_schema_node(
+                    item, item_schema, root_schema, f"{path}[{index}]", violations
+                )
+
+    if isinstance(instance, str):
+        minimum_length = schema.get("minLength")
+        if isinstance(minimum_length, int) and len(instance) < minimum_length:
+            violations.append(f"{path} is shorter than allowed")
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str) and re.search(pattern, instance) is None:
+            violations.append(f"{path} does not match the required pattern")
+        if schema.get("format") == "date-time" and not _is_rfc3339(instance):
+            violations.append(f"{path} is not deterministic RFC3339 text")
+
+    minimum = schema.get("minimum")
+    if (
+        isinstance(minimum, (int, float))
+        and isinstance(instance, (int, float))
+        and not isinstance(instance, bool)
+        and instance < minimum
+    ):
+        violations.append(f"{path} is below the allowed minimum")
+
+
+def _schema_branch_violations(
+    instance: object,
+    schema: object,
+    root_schema: Mapping[str, object],
+    path: str,
+) -> list[str]:
+    branch: list[str] = []
+    _validate_schema_node(instance, schema, root_schema, path, branch)
+    return branch
+
+
+def _local_schema_reference(
+    root_schema: Mapping[str, object], reference: object
+) -> object | None:
+    if not isinstance(reference, str) or not reference.startswith("#/"):
+        return None
+    current: object = root_schema
+    for component in reference[2:].split("/"):
+        component = component.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, Mapping) or component not in current:
+            return None
+        current = current[component]
+    return current
+
+
+def _matches_json_type(instance: object, expected: object) -> bool:
+    if isinstance(expected, list):
+        return any(_matches_json_type(instance, item) for item in expected)
+    checks = {
+        "object": lambda value: isinstance(value, Mapping),
+        "array": lambda value: isinstance(value, list),
+        "string": lambda value: isinstance(value, str),
+        "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
+        "number": lambda value: isinstance(value, (int, float))
+        and not isinstance(value, bool),
+        "boolean": lambda value: isinstance(value, bool),
+        "null": lambda value: value is None,
+    }
+    check = checks.get(expected)
+    return bool(check and check(instance))
 
 
 def _validate_output_path(output: Path) -> Path:
@@ -617,6 +988,7 @@ def _write_manifest(
     lineage_roots: tuple[str, ...],
     allow_conditional_promotion: bool,
     predecessor_package_id: str | None = None,
+    successor_created_at: str | None = None,
 ) -> None:
     records = inventory_tree(root, source_id=package_id)
     records = tuple(record for record in records if record.normalized_path != "MANIFEST.json")
@@ -638,6 +1010,8 @@ def _write_manifest(
     }
     if predecessor_package_id is not None:
         manifest["predecessor_package_id"] = predecessor_package_id
+    if successor_created_at is not None:
+        manifest["successor_created_at"] = successor_created_at
     files.sort(key=lambda item: str(item["path"]))
     _write_bytes_new(root / "MANIFEST.json", _json_bytes(manifest))
 
@@ -746,11 +1120,47 @@ def _update_successor_lineage(
         raise ValueError("lineage parent_ids must be a string list")
     lineage["package_id"] = successor_id
     lineage["created_at"] = successor_created_at
+    lineage["successor_created_at"] = successor_created_at
     lineage["status"] = PackageStatus.CANONICAL.value
     lineage["readiness"] = readiness.value
     lineage["parent_ids"] = [candidate_id]
     path.unlink()
     _write_json_new(path, lineage)
+
+
+def _update_successor_handoff(
+    path: Path,
+    *,
+    candidate_id: str,
+    successor_id: str,
+    candidate_created_at: str,
+    successor_created_at: str,
+    readiness: ReadinessStatus,
+) -> None:
+    text = path.read_text(encoding="utf-8")
+    warning = (
+        "> Warning: Candidate is not Canonical. Do not treat this package as "
+        "authoritative or route it to execution before explicit, scoped promotion approval."
+    )
+    replacements = {
+        f"# Continuity handoff: {candidate_id}": f"# Continuity handoff: {successor_id}",
+        f"- Package ID: `{candidate_id}`": f"- Package ID: `{successor_id}`",
+        f"- Created at: `{candidate_created_at}`": (
+            f"- Created at: `{successor_created_at}`"
+        ),
+        "- Lifecycle status: `Candidate`": "- Lifecycle status: `Canonical`",
+        f"- Readiness: `{readiness.value}`": f"- Readiness: `{readiness.value}`",
+        warning: (
+            "> Promotion record: This package is Canonical. Its Candidate predecessor "
+            "was not Canonical before exact, scoped approval."
+        ),
+    }
+    for existing, replacement in replacements.items():
+        if text.count(existing) != 1:
+            raise ValueError("candidate handoff metadata does not match its manifest")
+        text = text.replace(existing, replacement, 1)
+    path.unlink()
+    _write_bytes_new(path, text.encode("utf-8"))
 
 
 def _package_sha256(root: Path) -> str:
@@ -906,8 +1316,14 @@ def _validate_lineage_structure(
     _nonempty_string(lineage.get("package_id"), "lineage package_id", violations)
     _nonempty_string(lineage.get("project_id"), "lineage project_id", violations)
     _rfc3339_value(lineage.get("created_at"), "lineage created_at", violations)
-    _enum_value(PackageStatus, lineage.get("status"), "lineage status", violations)
+    status = _enum_value(PackageStatus, lineage.get("status"), "lineage status", violations)
     _enum_value(ReadinessStatus, lineage.get("readiness"), "lineage readiness", violations)
+    if status in {PackageStatus.CANONICAL, PackageStatus.SUPERSEDED}:
+        _rfc3339_value(
+            lineage.get("successor_created_at"),
+            "lineage successor_created_at",
+            violations,
+        )
     _validate_string_list(lineage.get("parent_ids"), "lineage parent_ids", violations)
     _validate_string_list(
         lineage.get("root_package_ids"), "lineage root_package_ids", violations

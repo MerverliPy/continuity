@@ -19,9 +19,13 @@ Use this skill after `reconcile-project-state` has produced approved inputs for 
 6. Require Explicit promotion approval before creating a new `Canonical` successor and its promotion receipt.
 7. Route the promoted canonical package to `superpowers-preflight` when an execution-readiness brief is requested.
 
+## Operating rules
+
+Load only the directly relevant reference files: use `skills/project-intelligence/references/package-contract.md` for package construction and `skills/project-intelligence/references/evidence-states.md` when rendering claim records. For every material claim, quote or cite the inspected file path and record ID. Keep source evidence read-only. Use the Continuity CLI for hashes, archive inspection, manifests, validation, packaging, and promotion. Pause for exactly scoped user authority when material conflicts exist or promotion scope is incomplete. Never label a `Candidate` as `Canonical`; only a separately validated successor with an exact promotion receipt is Canonical. Never route a `Blocked` package into execution. Return a useful Continuity package or blocker result even if Superpowers is absent.
+
 ## Output contract
 
-Return a candidate or canonical handoff record containing package identity, status, source lineage, validation result, unresolved facts, approved scope, prohibited actions, and any promotion receipt. A promotion creates a new successor and does not rewrite a candidate, source, or predecessor.
+Return a candidate or canonical handoff record containing package identity, status, source lineage, validation result, unresolved facts, approved scope, prohibited actions, inspected file path and record ID citations, and any promotion receipt. A promotion creates a new successor and does not rewrite a candidate, source, or predecessor.
 
 ## Stop conditions
 

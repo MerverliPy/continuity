@@ -19,9 +19,13 @@ Use this skill when inspection reports, integrity findings, lineage records, or 
 6. Produce a reconciliation report that identifies verified facts, assertions, unresolved facts, contradictions, missing evidence, conflict status, and authorized next actions.
 7. Route approved, complete reconciliation results to `create-canonical-handoff`; route a readiness-only request with a clear authority basis to `superpowers-preflight`.
 
+## Operating rules
+
+Load only the directly relevant reference files: classify evidence with `skills/project-intelligence/references/evidence-states.md` and check portable authority/lifecycle constraints with `skills/project-intelligence/references/package-contract.md`. For every material claim, quote or cite the inspected file path and record ID. Keep source evidence read-only. Use the Continuity CLI for hashes, archive inspection, manifests, validation, and packaging so comparisons use deterministic records. Pause for exactly scoped user authority when material conflicts exist; do not infer a decision from age, urgency, or broad approval. Never label a `Candidate` as `Canonical`, and never route a `Blocked` package into execution. Return a useful Continuity reconciliation result even if Superpowers is absent.
+
 ## Output contract
 
-Return a reconciliation report with the selected project, compared sources, integrity and lineage findings, claim provenance, materiality classification, required approval records, prohibited actions, and a `Ready`, `Conditional`, or `Blocked` readiness basis. It never upgrades unsupported claims to `Verified`.
+Return a reconciliation report with the selected project, compared sources, integrity and lineage findings, claim provenance, inspected file path and record ID for every material claim, materiality classification, required approval records, prohibited actions, and a `Ready`, `Conditional`, or `Blocked` readiness basis. It never upgrades unsupported claims to `Verified`.
 
 ## Stop conditions
 

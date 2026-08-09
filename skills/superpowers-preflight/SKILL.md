@@ -19,9 +19,13 @@ Use this skill when a selected project has a reconciliation report or validated 
 6. For `Ready` or `Conditional`, describe the relevant companion handoff only if Superpowers is available; otherwise return the portable brief without claiming any companion is installed.
 7. Return to `reconcile-project-state` when authority or material-conflict evidence is incomplete, and return to `project-intelligence` when the selected project is uncertain.
 
+## Operating rules
+
+Load only the directly relevant reference files: use `skills/project-intelligence/references/superpowers-handoff.md` for the companion boundary, `skills/project-intelligence/references/evidence-states.md` for cited readiness evidence, and `skills/project-intelligence/references/package-contract.md` when package lifecycle controls routing. For every material claim, quote or cite the inspected file path and record ID. Keep source evidence read-only. Use the Continuity CLI for hashes, archive inspection, manifests, validation, and packaging before relying on deterministic package facts. Pause for exactly scoped user authority when material conflicts exist. Never label a `Candidate` as `Canonical`, and never route a `Blocked` package into execution. Produce a useful Continuity preflight result even if Superpowers is absent.
+
 ## Output contract
 
-Return `SUPERPOWERS_PREFLIGHT.md` or equivalent structured content containing readiness, selected project, canonical scope, authorized actions, prohibited actions, unresolved facts, conditions, exact next action, evidence citations, and an optional companion-stage recommendation. A `Blocked` result includes no implementation-stage recommendation.
+Return `SUPERPOWERS_PREFLIGHT.md` or equivalent structured content containing readiness, selected project, canonical scope, authorized actions, prohibited actions, unresolved facts, conditions, exact next action, evidence citations with inspected file path and record ID, and an optional companion-stage recommendation. A `Blocked` result includes no implementation-stage recommendation.
 
 ## Stop conditions
 

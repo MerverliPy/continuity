@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://continuity.local/schemas/v1/preflight.schema.json",
+  "title": "Continuity v1 readiness preflight",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "project_id",
+    "package_id",
+    "status",
+    "reasons",
+    "conditions",
+    "authorized_actions",
+    "prohibited_actions",
+    "unresolved_actions",
+    "exact_next_action",
+    "companion_skill_or_stage",
+    "evidence_references"
+  ],
+  "properties": {
+    "schema": {"const": "continuity.preflight/v1"},
+    "project_id": {"$ref": "#/$defs/stableId"},
+    "package_id": {"$ref": "#/$defs/stableId"},
+    "status": {
+      "type": "string",
+      "enum": ["Ready", "Conditional", "Blocked"]
+    },
+    "reasons": {"$ref": "#/$defs/nonemptyStringList"},
+    "conditions": {"$ref": "#/$defs/stringList"},
+    "authorized_actions": {"$ref": "#/$defs/nonemptyStringList"},
+    "prohibited_actions": {"$ref": "#/$defs/nonemptyStringList"},
+    "unresolved_actions": {"$ref": "#/$defs/stringList"},
+    "exact_next_action": {
+      "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+    },
+    "companion_skill_or_stage": {
+      "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+    },
+    "evidence_references": {"$ref": "#/$defs/nonemptyStringList"},
+    "extensions": {"$ref": "#/$defs/extensions"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "Blocked"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "exact_next_action": {"type": "null"},
+          "companion_skill_or_stage": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {"exact_next_action": {"type": "string", "minLength": 1}}
+      }
+    }
+  ],
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+    },
+    "stringList": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "nonemptyStringList": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "extensions": {"type": "object", "additionalProperties": true}
+  }
+}

@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://continuity.local/schemas/v1/reconciliation.schema.json",
+  "title": "Continuity v1 reconciliation report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "claims",
+    "conflicts",
+    "findings",
+    "approvals",
+    "selected_claim_ids",
+    "blocking_conflict_ids",
+    "notes"
+  ],
+  "properties": {
+    "claims": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/claim"},
+      "uniqueItems": true
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/conflict"},
+      "uniqueItems": true
+    },
+    "findings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/finding"},
+      "uniqueItems": true
+    },
+    "approvals": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/approval"},
+      "uniqueItems": true
+    },
+    "selected_claim_ids": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/stableId"},
+      "uniqueItems": true
+    },
+    "blocking_conflict_ids": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/stableId"},
+      "uniqueItems": true
+    },
+    "notes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "extensions": {"$ref": "#/$defs/extensions"}
+  },
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidenceState": {
+      "type": "string",
+      "enum": ["Verified", "Asserted", "Unresolved", "Contradicted", "Missing"]
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_id",
+        "field",
+        "value",
+        "source_id",
+        "source_ref",
+        "evidence_state",
+        "recorded_at"
+      ],
+      "properties": {
+        "claim_id": {"$ref": "#/$defs/stableId"},
+        "field": {"type": "string", "minLength": 1},
+        "value": true,
+        "source_id": {"$ref": "#/$defs/stableId"},
+        "source_ref": {"type": "string", "minLength": 1},
+        "evidence_state": {"$ref": "#/$defs/evidenceState"},
+        "recorded_at": {
+          "anyOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]
+        },
+        "extensions": {"$ref": "#/$defs/extensions"}
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "action",
+        "scope",
+        "decision",
+        "source_id",
+        "source_ref",
+        "approved_at"
+      ],
+      "properties": {
+        "approval_id": {"$ref": "#/$defs/stableId"},
+        "action": {"type": "string", "minLength": 1},
+        "scope": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "decision": {"type": "string", "minLength": 1},
+        "source_id": {"$ref": "#/$defs/stableId"},
+        "source_ref": {"type": "string", "minLength": 1},
+        "approved_at": {"$ref": "#/$defs/timestamp"},
+        "extensions": {"$ref": "#/$defs/extensions"}
+      }
+    },
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "conflict_id",
+        "field",
+        "material",
+        "claim_ids",
+        "resolution_approval_id"
+      ],
+      "properties": {
+        "conflict_id": {"$ref": "#/$defs/stableId"},
+        "field": {"type": "string", "minLength": 1},
+        "material": {"type": "boolean"},
+        "claim_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/stableId"},
+          "uniqueItems": true
+        },
+        "resolution_approval_id": {
+          "anyOf": [{"$ref": "#/$defs/stableId"}, {"type": "null"}]
+        },
+        "extensions": {"$ref": "#/$defs/extensions"}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding_id",
+        "source_id",
+        "evidence_state",
+        "detail",
+        "structurally_valid",
+        "lineage_valid",
+        "lineage_required",
+        "expected_sha256",
+        "observed_sha256"
+      ],
+      "properties": {
+        "finding_id": {"$ref": "#/$defs/stableId"},
+        "source_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?:\\*|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)$"
+        },
+        "evidence_state": {"$ref": "#/$defs/evidenceState"},
+        "detail": {"type": "string"},
+        "structurally_valid": {"type": ["boolean", "null"]},
+        "lineage_valid": {"type": ["boolean", "null"]},
+        "lineage_required": {"type": "boolean"},
+        "expected_sha256": {
+          "anyOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]
+        },
+        "observed_sha256": {
+          "anyOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]
+        },
+        "extensions": {"$ref": "#/$defs/extensions"}
+      }
+    },
+    "extensions": {"type": "object", "additionalProperties": true}
+  }
+}

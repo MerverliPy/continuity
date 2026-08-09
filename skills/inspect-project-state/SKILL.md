@@ -19,9 +19,13 @@ Use this skill after `project-intelligence` has selected one project and the req
 6. Return one inspection report with citations to source artifacts and clear limits on what was not inspected.
 7. Route competing states or claims to `reconcile-project-state`; return to `project-intelligence` when the selected scope or intended route changes.
 
+## Operating rules
+
+Load only the directly relevant reference files: use `skills/project-intelligence/references/evidence-states.md` while classifying claims and `skills/project-intelligence/references/package-contract.md` only when inspecting a portable package. For every material claim, quote or cite the inspected file path and record ID. Keep source evidence read-only. Use the Continuity CLI for hashes, archive inspection, manifests, validation, and packaging; do not substitute manual digest or archive handling. Pause for exactly scoped user authority when material conflicts exist. Never label a `Candidate` as `Canonical`, and never route a `Blocked` package into execution. Produce a useful Continuity inspection result even if Superpowers is absent.
+
 ## Output contract
 
-Return an inspection report containing the selected project, source inventory, source references for extracted claims, integrity observations, evidence states, unresolved facts, and safety gates. The report distinguishes an absent required artifact from an artifact that was merely outside the inspected scope.
+Return an inspection report containing the selected project, source inventory, source references for extracted claims, integrity observations, evidence states, unresolved facts, and safety gates. Each material claim includes its inspected file path and record ID. The report distinguishes an absent required artifact from an artifact that was merely outside the inspected scope.
 
 ## Stop conditions
 

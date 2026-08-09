@@ -17,6 +17,7 @@ from continuity.models import (
 from continuity.packaging import (
     CandidateBuildRequest,
     _publish_release_no_replace,
+    _render_template,
     _write_manifest,
     build_candidate,
     promote_candidate,
@@ -225,8 +226,74 @@ def _regenerate_integrity(root: Path) -> None:
         lineage_roots=tuple(manifest["lineage_roots"]),
         allow_conditional_promotion=manifest["allow_conditional_promotion"],
         predecessor_package_id=manifest.get("predecessor_package_id"),
+        successor_created_at=manifest.get("successor_created_at"),
     )
     write_sha256s(root, checksum_path)
+
+
+def test_template_renderer_rejects_missing_and_unused_tokens() -> None:
+    """Catches silently blank or misspelled fields in generated handoff documents."""
+    assert _render_template("Project {{ project_id }}\n", {"project_id": "alpha"}) == (
+        "Project alpha\n"
+    )
+
+    with pytest.raises(ValueError, match="missing template tokens: project_id"):
+        _render_template("Project {{ project_id }}\n", {})
+
+    with pytest.raises(ValueError, match="unused template tokens: project_name"):
+        _render_template(
+            "Project {{ project_id }}\n",
+            {"project_id": "alpha", "project_name": "Alpha"},
+        )
+
+
+def test_candidate_documents_are_rendered_from_bundled_templates(tmp_path: Path) -> None:
+    """Catches package construction bypassing the reviewed v1 document structure."""
+    result = build_candidate(_request(tmp_path))
+    handoff = (result.root / "HANDOFF_README.md").read_text(encoding="utf-8")
+    canonical_state = (result.root / "CANONICAL_STATE.md").read_text(encoding="utf-8")
+
+    assert "# Continuity handoff: candidate-alpha" in handoff
+    assert "Candidate is not Canonical" in handoff
+    assert "# HANDOFF_README.md" in handoff
+    assert "| Material claim | Value | Evidence state | Source reference | Record ID |" in (
+        canonical_state
+    )
+    assert "# CANONICAL_STATE.md" in canonical_state
+
+
+def test_nested_schema_extension_is_rejected_before_publication(tmp_path: Path) -> None:
+    """Catches undeclared nested evidence fields crossing the construction boundary."""
+    request = _request(tmp_path)
+    evidence = dict(request.evidence_index)
+    evidence["items"] = [
+        {**evidence["items"][0], "implicit_authority": "deploy"}  # type: ignore[index]
+    ]
+    request = CandidateBuildRequest(
+        **{**request.__dict__, "evidence_index": evidence}
+    )
+
+    with pytest.raises(ValueError, match="evidence schema"):
+        build_candidate(request)
+
+    assert not request.output.exists()
+
+
+def test_independent_validation_rejects_nested_authority_extension(
+    tmp_path: Path,
+) -> None:
+    """Catches checksum-valid undeclared authority being trusted after construction."""
+    result = build_candidate(_request(tmp_path, report=_resolved_report()))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["approvals"][0]["implicit_scope"] = ["deployment"]
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("reconciliation schema" in item for item in validation.violations)
 
 
 def test_candidate_contract_is_complete_and_sources_are_unchanged(tmp_path: Path) -> None:
@@ -932,8 +999,16 @@ def test_promotion_is_append_only_and_regenerates_integrity_artifacts(tmp_path: 
     assert receipt["approval"]["approval_id"] == "approval-promote-alpha"
     successor_manifest = json.loads((canonical.root / "MANIFEST.json").read_text())
     successor_lineage = json.loads((canonical.root / "lineage/LINEAGE.json").read_text())
+    successor_handoff = (canonical.root / "HANDOFF_README.md").read_text(encoding="utf-8")
     assert successor_manifest["created_at"] == "2026-08-09T14:00:00Z"
     assert successor_lineage["created_at"] == "2026-08-09T14:00:00Z"
+    assert successor_manifest["successor_created_at"] == "2026-08-09T14:00:00Z"
+    assert successor_lineage["successor_created_at"] == "2026-08-09T14:00:00Z"
+    assert "# Continuity handoff: canonical-alpha" in successor_handoff
+    assert "- Package ID: `canonical-alpha`" in successor_handoff
+    assert "- Created at: `2026-08-09T14:00:00Z`" in successor_handoff
+    assert "- Lifecycle status: `Canonical`" in successor_handoff
+    assert "Candidate predecessor was not Canonical" in successor_handoff
     assert _package_snapshot(candidate.root) == candidate_before
     assert candidate.zip_path.read_bytes() == candidate_zip_before
     assert canonical.zip_path.read_bytes() != candidate.zip_path.read_bytes()
