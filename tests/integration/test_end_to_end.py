@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -197,6 +198,88 @@ def _standalone_preflight_report() -> dict[str, object]:
     }
 
 
+def _create_valid_handoff(
+    wrapper: Path,
+    tmp_path: Path,
+    root: Path,
+    package_id: str,
+) -> Path:
+    seed_root = tmp_path / f".{package_id}-seed"
+    seed_root.mkdir()
+    seed = seed_root / "app.py"
+    seed.write_text("print('preserved source')\n", encoding="utf-8")
+    source_hashes = {"source": _tree_sha256(seed_root)}
+    report = _standalone_preflight_report()
+    report_path = _json_file(tmp_path / f".{package_id}-report.json", report)
+    preflight, _ = _run(
+        wrapper,
+        "preflight",
+        "--reconciliation",
+        report_path,
+        "--project-id",
+        "alpha",
+        "--package-id",
+        package_id,
+        "--requested-action",
+        "implementation",
+        "--output",
+        tmp_path / f".{package_id}-preflight.json",
+        expected=0,
+    )
+    request = _json_file(
+        tmp_path / f".{package_id}-request.json",
+        {
+            "package_id": package_id,
+            "project_id": "alpha",
+            "created_at": "2026-08-09T09:00:00Z",
+            "selected_source_hashes": source_hashes,
+            "reconciliation_report": report,
+            "canonical_files": {"app.py": str(seed)},
+            "rendered_documents": {
+                path: "Supplemental narrative; structured records govern.\n"
+                for path in DOCUMENT_PATHS
+            },
+            "preflight_decision": preflight,
+            "lineage_data": {
+                "schema": "continuity.lineage/v1",
+                "package_id": package_id,
+                "project_id": "alpha",
+                "created_at": "2026-08-09T09:00:00Z",
+                "status": "Candidate",
+                "readiness": "Ready",
+                "parent_ids": [],
+                "root_package_ids": [],
+                "source_hashes": source_hashes,
+            },
+            "evidence_index": {
+                "schema": "continuity.evidence-index/v1",
+                "items": [
+                    {
+                        "source_id": "source",
+                        "state": "Verified",
+                        "reference": "external-by-sha256",
+                    }
+                ],
+            },
+            "secure_handling_approvals": [],
+            "readiness": "Ready",
+            "allow_conditional_promotion": False,
+        },
+    )
+    release = tmp_path / f".{package_id}-release"
+    _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        release,
+        expected=0,
+    )
+    shutil.copytree(release / "package", root)
+    return release
+
+
 def _wrap_zip(source: Path, destination: Path) -> None:
     with zipfile.ZipFile(source, "r") as input_archive, zipfile.ZipFile(
         destination, "w"
@@ -212,17 +295,8 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
     older = tmp_path / "older"
     newer = tmp_path / "newer"
-    _complete_handoff(older)
-    _complete_handoff(newer)
-    (newer / "app.py").write_text(
-        "# Incomplete draft: no authoritative project-state claims.\n", encoding="utf-8"
-    )
-    lines = []
-    for path in sorted(
-        item for item in newer.iterdir() if item.is_file() and item.name != "SHA256SUMS.txt"
-    ):
-        lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
-    (newer / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _create_valid_handoff(wrapper, tmp_path, older, "older-source")
+    _create_valid_handoff(wrapper, tmp_path, newer, "newer-source")
     sources_before = {"older": _snapshot(older), "newer": _snapshot(newer)}
 
     inspect_results: dict[str, dict[str, object]] = {}
@@ -313,7 +387,7 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
             "created_at": "2026-08-09T12:30:00Z",
             "selected_source_hashes": selected_hashes,
             "reconciliation_report": reconciliation["report"],
-            "canonical_files": {"src/app.py": str(older / "app.py")},
+            "canonical_files": {"src/app.py": str(older / "canonical/app.py")},
             "rendered_documents": {
                 path: f"# {path}\n\nVerified Continuity state.\n" for path in DOCUMENT_PATHS
             },
@@ -557,8 +631,8 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
     wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
     left = tmp_path / "left"
     right = tmp_path / "right"
-    _complete_handoff(left)
-    _complete_handoff(right)
+    _create_valid_handoff(wrapper, tmp_path, left, "left-source")
+    _create_valid_handoff(wrapper, tmp_path, right, "right-source")
     sources_before = {"left": _snapshot(left), "right": _snapshot(right)}
 
     findings = []
@@ -627,7 +701,7 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
             "created_at": "2026-08-09T12:30:00Z",
             "selected_source_hashes": selected_hashes,
             "reconciliation_report": reconciled["report"],
-            "canonical_files": {"src/app.py": str(left / "app.py")},
+            "canonical_files": {"src/app.py": str(left / "canonical/app.py")},
             "rendered_documents": {
                 path: f"# {path}\n\nBlocked Continuity state.\n" for path in DOCUMENT_PATHS
             },
@@ -1101,6 +1175,90 @@ def test_safe_non_package_zip_remains_unresolved(
     assert payload["integrity"]["evidence_state"] == "Unresolved"
     assert payload["integrity"]["source_ref"] == "zip://notes.zip"
     assert payload["archive"]["code"] == "package-integrity-evidence-incomplete"
+
+
+def test_fabricated_continuity_directory_is_not_verified(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches matching checksums elevating an invalid package manifest to authority."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source = tmp_path / "fabricated-directory"
+    _complete_handoff(source)
+    (source / "claims.json").write_text("[]\n", encoding="utf-8")
+    checksum_lines = []
+    for path in sorted(
+        item for item in source.iterdir() if item.is_file() and item.name != "SHA256SUMS.txt"
+    ):
+        checksum_lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+    (source / "SHA256SUMS.txt").write_text(
+        "\n".join(checksum_lines) + "\n", encoding="utf-8"
+    )
+    before = _snapshot(source)
+
+    payload, _ = _run(
+        wrapper,
+        "inspect",
+        source,
+        "--output",
+        tmp_path / "fabricated-directory.json",
+        expected=0,
+    )
+
+    assert payload["integrity"]["evidence_state"] == "Contradicted"
+    assert payload["integrity"]["structurally_valid"] is False
+    assert payload["integrity"]["detail"] == "package-validation-failed"
+    assert _snapshot(source) == before
+
+
+def test_valid_unpacked_package_directory_is_verified_without_mutation(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches directory inspection diverging from package validation authority."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    package_copy = tmp_path / "valid-unpacked"
+    source = _create_valid_handoff(
+        wrapper, tmp_path, package_copy, "valid-unpacked-source"
+    )
+    before = _snapshot(source)
+
+    payload, _ = _run(
+        wrapper,
+        "inspect",
+        source,
+        "--output",
+        tmp_path / "valid-unpacked.json",
+        expected=0,
+    )
+
+    assert payload["integrity"]["evidence_state"] == "Verified"
+    assert payload["integrity"]["structurally_valid"] is True
+    assert payload["integrity"]["detail"] == "package-verified"
+    assert _snapshot(source) == before
+
+
+def test_ordinary_directory_without_continuity_contract_is_unresolved(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches an ordinary repository being mislabeled Missing or Verified authority."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source = tmp_path / "ordinary-repo"
+    source.mkdir()
+    (source / "app.py").write_text("print('ordinary')\n", encoding="utf-8")
+    before = _snapshot(source)
+
+    payload, _ = _run(
+        wrapper,
+        "inspect",
+        source,
+        "--output",
+        tmp_path / "ordinary.json",
+        expected=0,
+    )
+
+    assert payload["integrity"]["evidence_state"] == "Unresolved"
+    assert payload["integrity"]["structurally_valid"] is False
+    assert payload["integrity"]["detail"] == "package-integrity-evidence-incomplete"
+    assert _snapshot(source) == before
 
 
 def test_malformed_checksum_and_secret_member_are_sanitized(

@@ -15,7 +15,7 @@ import tempfile
 from typing import Callable, Mapping, Sequence
 
 from .archives import inspect_zip, safe_extract_zip
-from .hashing import inventory_tree, sha256_file, verify_sha256s
+from .hashing import inventory_tree, sha256_file
 from .models import (
     ApprovalRecord,
     ClaimRecord,
@@ -209,24 +209,20 @@ def _inspect_command(namespace: argparse.Namespace) -> _CommandResult:
 def _inspect_directory(source: Path, source_id: str) -> _CommandResult:
     records = inventory_tree(source, source_id)
     root_hash = _directory_sha256(source)
-    manifest_present = _regular_file(source / "MANIFEST.json")
-    checksum = source / "SHA256SUMS.txt"
-    checksum_present = _regular_file(checksum)
-    checksum_verified = False
-    if checksum_present:
-        try:
-            checksum_verified = verify_sha256s(source, checksum).verified
-        except (OSError, UnicodeError, ValueError):
-            checksum_verified = False
-    if manifest_present and checksum_verified:
-        state = EvidenceState.VERIFIED
-        detail = "manifest and checksum inventory verified"
-    elif not manifest_present or not checksum_present:
-        state = EvidenceState.MISSING
-        detail = "required manifest or checksum inventory is missing"
+    package_root = _package_root(source)
+    manifest_present = _regular_file(package_root / "MANIFEST.json")
+    checksum_present = _regular_file(package_root / "SHA256SUMS.txt")
+    if manifest_present and checksum_present:
+        validation = validate_package(package_root)
+        if validation.valid:
+            state = EvidenceState.VERIFIED
+            detail = "package-verified"
+        else:
+            state = EvidenceState.CONTRADICTED
+            detail = "package-validation-failed"
     else:
-        state = EvidenceState.CONTRADICTED
-        detail = "checksum inventory does not match source bytes"
+        state = EvidenceState.UNRESOLVED
+        detail = "package-integrity-evidence-incomplete"
     integrity = IntegrityFinding(
         finding_id=_finding_id(source_id),
         source_id=source_id,
