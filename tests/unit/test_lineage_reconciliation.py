@@ -1,12 +1,20 @@
 import hashlib
+from dataclasses import replace
 
 import pytest
 
 from continuity.lineage import LineageState, SourcePackage, build_lineage
-from continuity.models import ApprovalRecord, ClaimRecord, EvidenceState, PackageStatus
+from continuity.models import (
+    ApprovalRecord,
+    ClaimRecord,
+    ConflictRecord,
+    EvidenceState,
+    PackageStatus,
+)
 from continuity.reconciliation import (
     IntegrityFinding,
     conflict_id_for,
+    reconciliation_consistency_violations,
     reconcile_sources,
 )
 
@@ -442,6 +450,95 @@ def test_non_material_formatting_differences_do_not_block() -> None:
 
     assert report.selected_claim_ids == ("claim-title-a", "claim-title-b")
     assert report.blocking_conflicts == ()
+
+
+@pytest.mark.parametrize("field", ("database", "deployment target", "framework"))
+def test_arbitrary_semantic_differences_are_material_by_default(field: str) -> None:
+    """Catches an unknown field name silently authorizing competing semantic values."""
+    left = _claim(f"claim-{field}-a", field, "PostgreSQL", "a")
+    right = _claim(f"claim-{field}-b", field, "SQLite", "b")
+
+    report = reconcile_sources((left, right), (), (both_integrity_pass,))
+
+    assert report.selected_claim_ids == ()
+    assert len(report.blocking_conflicts) == 1
+    assert report.blocking_conflicts[0].material is True
+
+
+def test_arbitrary_field_formatting_equivalence_preserves_provenance() -> None:
+    """Catches normalization-equivalent values becoming a fabricated conflict."""
+    left = _claim("claim-db-a", "database", "PostgreSQL", "a")
+    right = _claim("claim-db-b", "database", "  postgresql  ", "b")
+
+    report = reconcile_sources((left, right), (), (both_integrity_pass,))
+
+    assert report.selected_claim_ids == (left.claim_id, right.claim_id)
+    assert report.conflicts == ()
+
+
+def test_arbitrary_field_exact_resolution_selects_only_approved_claim() -> None:
+    """Catches fail-closed materiality discarding an exact scoped user resolution."""
+    selected = _claim("claim-db-postgres", "database", "PostgreSQL", "a")
+    competing = _claim("claim-db-sqlite", "database", "SQLite", "b")
+    conflict_id = conflict_id_for("database", (selected, competing))
+    approval = ApprovalRecord(
+        "approval-database",
+        "resolve-conflict",
+        (conflict_id,),
+        selected.claim_id,
+        "user",
+        "conversation://resolution/database",
+        "2026-08-09T12:00:00Z",
+    )
+
+    report = reconcile_sources(
+        (selected, competing), (approval,), (both_integrity_pass,)
+    )
+
+    assert report.selected_claim_ids == (selected.claim_id,)
+    assert report.blocking_conflicts == ()
+    assert report.conflicts[0].resolution_approval_id == approval.approval_id
+
+
+def test_consistency_rejects_omitted_conflict_and_forged_selection() -> None:
+    """Catches a receipt deleting a derived conflict while selecting both alternatives."""
+    left = _claim("claim-db-postgres", "database", "PostgreSQL", "a")
+    right = _claim("claim-db-sqlite", "database", "SQLite", "b")
+    canonical = reconcile_sources((left, right), (), (both_integrity_pass,))
+    forged = replace(
+        canonical,
+        conflicts=(),
+        selected_claim_ids=(left.claim_id, right.claim_id),
+    )
+
+    violations = reconciliation_consistency_violations(forged)
+
+    assert "selected claims do not match canonical reconciliation" in violations
+    assert "conflicts do not match canonical reconciliation" in violations
+    assert "blocking conflicts do not match canonical reconciliation" in violations
+
+
+def test_consistency_rejects_extra_or_forged_conflict_metadata() -> None:
+    """Catches invented conflicts and changed material/resolution metadata."""
+    left = _claim("claim-db-postgres", "database", "PostgreSQL", "a")
+    right = _claim("claim-db-sqlite", "database", "SQLite", "b")
+    canonical = reconcile_sources((left, right), (), (both_integrity_pass,))
+    conflict = canonical.conflicts[0]
+    forged = replace(
+        canonical,
+        conflicts=(
+            replace(conflict, material=False, resolution_approval_id="approval-forged"),
+            ConflictRecord(
+                "conflict-extra",
+                "invented",
+                True,
+                (left.claim_id,),
+                None,
+            ),
+        ),
+    )
+
+    assert reconciliation_consistency_violations(forged)
 
 
 @pytest.mark.parametrize(

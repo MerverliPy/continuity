@@ -33,6 +33,7 @@ from .reconciliation import (
     IntegrityFinding,
     ReconciliationReport,
     integrity_finding_permits_automatic_selection,
+    reconciliation_consistency_violations,
 )
 from .redaction import redact_text
 from .readiness import classify_readiness
@@ -373,6 +374,17 @@ def _validate_package(root: Path) -> PackageValidation:
         _validate_evidence_structure(evidence_index, violations)
     if reconciliation is not None:
         _validate_reconciliation_structure(reconciliation, violations)
+        try:
+            parsed_reconciliation = _reconciliation_report_from_mapping(reconciliation)
+        except (KeyError, TypeError, ValueError):
+            violations.append("reconciliation consistency cannot be recomputed")
+        else:
+            violations.extend(
+                f"reconciliation consistency: {violation}"
+                for violation in reconciliation_consistency_violations(
+                    parsed_reconciliation
+                )
+            )
         _validate_selected_project_identity(reconciliation, project_id, violations)
     if preflight is not None and manifest is not None:
         if preflight.get("project_id") != project_id:
@@ -637,6 +649,12 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         raise ValueError("reconciliation report is not structurally valid") from error
     reconciliation_violations: list[str] = []
     _validate_reconciliation_structure(reconciliation, reconciliation_violations)
+    reconciliation_violations.extend(
+        f"reconciliation report is inconsistent: {violation}"
+        for violation in reconciliation_consistency_violations(
+            request.approved_reconciliation_report
+        )
+    )
     _validate_selected_project_identity(
         reconciliation, request.project_id, reconciliation_violations
     )
@@ -1161,77 +1179,7 @@ def _serialized_preflight_matches_report(
     """Reapply readiness gates during independent package validation."""
 
     try:
-        report = ReconciliationReport(
-            claims=tuple(
-                ClaimRecord(
-                    claim_id=str(item["claim_id"]),
-                    field=str(item["field"]),
-                    value=item.get("value"),
-                    source_id=str(item["source_id"]),
-                    source_ref=str(item["source_ref"]),
-                    evidence_state=EvidenceState(str(item["evidence_state"])),
-                    recorded_at=(
-                        str(item["recorded_at"])
-                        if item.get("recorded_at") is not None
-                        else None
-                    ),
-                )
-                for item in _report_records(reconciliation, "claims")
-            ),
-            approvals=tuple(
-                ApprovalRecord(
-                    approval_id=str(item["approval_id"]),
-                    action=str(item["action"]),
-                    scope=tuple(str(value) for value in item["scope"]),
-                    decision=str(item["decision"]),
-                    source_id=str(item["source_id"]),
-                    source_ref=str(item["source_ref"]),
-                    approved_at=str(item["approved_at"]),
-                )
-                for item in _report_records(reconciliation, "approvals")
-            ),
-            findings=tuple(
-                IntegrityFinding(
-                    finding_id=str(item["finding_id"]),
-                    source_id=str(item["source_id"]),
-                    evidence_state=EvidenceState(str(item["evidence_state"])),
-                    source_ref=str(item["source_ref"]),
-                    detail=str(item["detail"]),
-                    structurally_valid=item.get("structurally_valid"),
-                    lineage_valid=item.get("lineage_valid"),
-                    lineage_required=item.get("lineage_required") is True,
-                    expected_sha256=(
-                        str(item["expected_sha256"])
-                        if item.get("expected_sha256") is not None
-                        else None
-                    ),
-                    observed_sha256=(
-                        str(item["observed_sha256"])
-                        if item.get("observed_sha256") is not None
-                        else None
-                    ),
-                )
-                for item in _report_records(reconciliation, "findings")
-            ),
-            conflicts=tuple(
-                ConflictRecord(
-                    conflict_id=str(item["conflict_id"]),
-                    field=str(item["field"]),
-                    material=item["material"] is True,
-                    claim_ids=tuple(str(value) for value in item["claim_ids"]),
-                    resolution_approval_id=(
-                        str(item["resolution_approval_id"])
-                        if item.get("resolution_approval_id") is not None
-                        else None
-                    ),
-                )
-                for item in _report_records(reconciliation, "conflicts")
-            ),
-            selected_claim_ids=tuple(
-                str(value) for value in reconciliation["selected_claim_ids"]
-            ),
-            notes=tuple(str(value) for value in reconciliation["notes"]),
-        )
+        report = _reconciliation_report_from_mapping(reconciliation)
         record = PreflightRecord(
             project_id=str(preflight["project_id"]),
             package_id=str(preflight["package_id"]),
@@ -1264,6 +1212,84 @@ def _serialized_preflight_matches_report(
     except (KeyError, TypeError, ValueError):
         return False
     return _preflight_matches_report(record, report)
+
+
+def _reconciliation_report_from_mapping(
+    reconciliation: Mapping[str, object],
+) -> ReconciliationReport:
+    """Reconstruct typed reconciliation inputs for independent recomputation."""
+
+    return ReconciliationReport(
+        claims=tuple(
+            ClaimRecord(
+                claim_id=str(item["claim_id"]),
+                field=str(item["field"]),
+                value=item.get("value"),
+                source_id=str(item["source_id"]),
+                source_ref=str(item["source_ref"]),
+                evidence_state=EvidenceState(str(item["evidence_state"])),
+                recorded_at=(
+                    str(item["recorded_at"])
+                    if item.get("recorded_at") is not None
+                    else None
+                ),
+            )
+            for item in _report_records(reconciliation, "claims")
+        ),
+        approvals=tuple(
+            ApprovalRecord(
+                approval_id=str(item["approval_id"]),
+                action=str(item["action"]),
+                scope=tuple(str(value) for value in item["scope"]),
+                decision=str(item["decision"]),
+                source_id=str(item["source_id"]),
+                source_ref=str(item["source_ref"]),
+                approved_at=str(item["approved_at"]),
+            )
+            for item in _report_records(reconciliation, "approvals")
+        ),
+        findings=tuple(
+            IntegrityFinding(
+                finding_id=str(item["finding_id"]),
+                source_id=str(item["source_id"]),
+                evidence_state=EvidenceState(str(item["evidence_state"])),
+                source_ref=str(item["source_ref"]),
+                detail=str(item["detail"]),
+                structurally_valid=item.get("structurally_valid"),
+                lineage_valid=item.get("lineage_valid"),
+                lineage_required=item.get("lineage_required") is True,
+                expected_sha256=(
+                    str(item["expected_sha256"])
+                    if item.get("expected_sha256") is not None
+                    else None
+                ),
+                observed_sha256=(
+                    str(item["observed_sha256"])
+                    if item.get("observed_sha256") is not None
+                    else None
+                ),
+            )
+            for item in _report_records(reconciliation, "findings")
+        ),
+        conflicts=tuple(
+            ConflictRecord(
+                conflict_id=str(item["conflict_id"]),
+                field=str(item["field"]),
+                material=item["material"] is True,
+                claim_ids=tuple(str(value) for value in item["claim_ids"]),
+                resolution_approval_id=(
+                    str(item["resolution_approval_id"])
+                    if item.get("resolution_approval_id") is not None
+                    else None
+                ),
+            )
+            for item in _report_records(reconciliation, "conflicts")
+        ),
+        selected_claim_ids=tuple(
+            str(value) for value in reconciliation["selected_claim_ids"]
+        ),
+        notes=tuple(str(value) for value in reconciliation["notes"]),
+    )
 
 
 def _render_template(template: str, values: Mapping[str, str]) -> str:

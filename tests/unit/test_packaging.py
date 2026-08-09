@@ -18,13 +18,18 @@ from continuity.models import (
 from continuity.packaging import (
     CandidateBuildRequest,
     _publish_release_no_replace,
+    _render_documents_from_structured_inputs,
     _render_template,
     _write_manifest,
     build_candidate,
     promote_candidate,
     validate_package,
 )
-from continuity.reconciliation import IntegrityFinding, ReconciliationReport
+from continuity.reconciliation import (
+    IntegrityFinding,
+    ReconciliationReport,
+    reconcile_sources,
+)
 from continuity.readiness import classify_readiness
 
 
@@ -74,15 +79,6 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
         "conversation://approval/implementation",
         "2026-08-09T11:00:00Z",
     )
-    conflict = (
-        ConflictRecord(
-            "conflict-architecture",
-            "architecture",
-            True,
-            ("claim-monolith", "claim-services"),
-            None,
-        ),
-    ) if blocked else ()
     competing_claims = (
         ClaimRecord(
             "claim-monolith",
@@ -101,50 +97,68 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
             EvidenceState.VERIFIED,
         ),
     ) if blocked else ()
-    return ReconciliationReport(
-        claims=(project, lifecycle, action, *competing_claims),
-        approvals=(implementation_approval,),
-        findings=(
-            IntegrityFinding(
-                "integrity-source",
-                "source-tree",
-                EvidenceState.VERIFIED,
-                source_ref="source/SHA256SUMS.txt#integrity-source",
-                structurally_valid=True,
-                lineage_valid=True,
-            ),
+    findings = (
+        IntegrityFinding(
+            "integrity-source",
+            "source-tree",
+            EvidenceState.VERIFIED,
+            source_ref="source/SHA256SUMS.txt#integrity-source",
+            structurally_valid=True,
+            lineage_valid=True,
         ),
-        conflicts=conflict,
-        selected_claim_ids=(project.claim_id, lifecycle.claim_id, action.claim_id),
-        notes=(),
+    )
+    return reconcile_sources(
+        (project, lifecycle, action, *competing_claims),
+        (implementation_approval,),
+        findings,
     )
 
 
 def _resolved_report() -> ReconciliationReport:
     blocked = _report(blocked=True)
+    conflict_id = blocked.conflicts[0].conflict_id
     approval = ApprovalRecord(
         "approval-architecture",
         "resolve-conflict",
-        ("conflict-architecture",),
+        (conflict_id,),
         "claim-monolith",
         "user",
         "conversation://resolution/architecture",
         "2026-08-09T11:00:00Z",
     )
-    conflict = ConflictRecord(
-        "conflict-architecture",
-        "architecture",
-        True,
-        ("claim-monolith", "claim-services"),
-        approval.approval_id,
+    return reconcile_sources(
+        blocked.claims,
+        (*blocked.approvals, approval),
+        blocked.findings,
+    )
+
+
+def _forged_database_report() -> ReconciliationReport:
+    """Return the exact omitted-conflict reviewer reproduction."""
+    report = _report()
+    postgres = ClaimRecord(
+        "claim-db-postgres",
+        "database",
+        "PostgreSQL",
+        "source-tree",
+        "source/database-postgres.json",
+        EvidenceState.VERIFIED,
+    )
+    sqlite = ClaimRecord(
+        "claim-db-sqlite",
+        "database",
+        "SQLite",
+        "source-tree",
+        "source/database-sqlite.json",
+        EvidenceState.VERIFIED,
     )
     return ReconciliationReport(
-        claims=blocked.claims,
-        approvals=(*blocked.approvals, approval),
-        findings=blocked.findings,
-        conflicts=(conflict,),
-        selected_claim_ids=(*blocked.selected_claim_ids, "claim-monolith"),
-        notes=(),
+        claims=(*report.claims, postgres, sqlite),
+        approvals=report.approvals,
+        findings=report.findings,
+        conflicts=(),
+        selected_claim_ids=(*report.selected_claim_ids, postgres.claim_id, sqlite.claim_id),
+        notes=report.notes,
     )
 
 
@@ -522,7 +536,7 @@ def test_unresolved_includes_verified_finding_without_required_lineage_proof(
     report = ReconciliationReport(
         claims=report.claims,
         approvals=report.approvals,
-        findings=(finding,),
+        findings=(*report.findings, finding),
         conflicts=report.conflicts,
         selected_claim_ids=report.selected_claim_ids,
         notes=report.notes,
@@ -573,7 +587,7 @@ def test_unresolved_includes_verified_integrity_hash_mismatch(tmp_path: Path) ->
     report = _report()
     mismatch = IntegrityFinding(
         "finding-hash-mismatch",
-        "source-tree",
+        "source-hash-mismatch",
         EvidenceState.VERIFIED,
         source_ref="source/SHA256SUMS.txt#src/app.py",
         detail="selected source digest differs from observed bytes",
@@ -585,7 +599,7 @@ def test_unresolved_includes_verified_integrity_hash_mismatch(tmp_path: Path) ->
     report = ReconciliationReport(
         claims=report.claims,
         approvals=report.approvals,
-        findings=(mismatch,),
+        findings=(*report.findings, mismatch),
         conflicts=report.conflicts,
         selected_claim_ids=report.selected_claim_ids,
         notes=report.notes,
@@ -614,7 +628,7 @@ def test_incomplete_digest_pair_blocks_package_and_appears_in_unresolved(
     report = _report()
     finding = IntegrityFinding(
         "finding-incomplete-digest",
-        "source-tree",
+        "source-incomplete-digest",
         EvidenceState.VERIFIED,
         source_ref="source/SHA256SUMS.txt#src/app.py",
         detail="digest comparison is incomplete",
@@ -626,7 +640,7 @@ def test_incomplete_digest_pair_blocks_package_and_appears_in_unresolved(
     report = ReconciliationReport(
         claims=report.claims,
         approvals=report.approvals,
-        findings=(finding,),
+        findings=(*report.findings, finding),
         conflicts=report.conflicts,
         selected_claim_ids=report.selected_claim_ids,
         notes=report.notes,
@@ -722,7 +736,7 @@ def test_structured_thematic_breaks_are_neutralized(tmp_path: Path) -> None:
         ("HANDOFF_README.md", "- Package ID: `candidate-alpha`"),
         ("CANONICAL_STATE.md", "claim-monolith"),
         ("AUTHORITY_LEDGER.md", "approval-architecture"),
-        ("CONFLICT_RESOLUTIONS.md", "conflict-architecture"),
+        ("CONFLICT_RESOLUTIONS.md", "conflict-"),
         ("UNRESOLVED.md", "## Unresolved records"),
         ("NEXT_THREAD_PROMPT.txt", "Exact next action: `implementation`"),
         (
@@ -1385,13 +1399,14 @@ def test_lineage_source_hashes_must_match_selected_sources(tmp_path: Path) -> No
 def test_build_rejects_mismatched_selected_project_claim(tmp_path: Path) -> None:
     """Catches request identity being accepted without reconciliation authority."""
     report = _report()
+    project_claim = next(claim for claim in report.claims if claim.field == "project id")
     mismatched = ClaimRecord(
-        report.claims[0].claim_id,
-        report.claims[0].field,
+        project_claim.claim_id,
+        project_claim.field,
         "beta",
-        report.claims[0].source_id,
-        report.claims[0].source_ref,
-        report.claims[0].evidence_state,
+        project_claim.source_id,
+        project_claim.source_ref,
+        project_claim.evidence_state,
     )
     report = ReconciliationReport(
         claims=(mismatched,),
@@ -1407,6 +1422,60 @@ def test_build_rejects_mismatched_selected_project_claim(tmp_path: Path) -> None
         build_candidate(request)
 
     assert not request.output.exists()
+
+
+def test_build_rejects_forged_omitted_database_conflict(tmp_path: Path) -> None:
+    """Catches candidate construction trusting a conflict-free forged report."""
+    request = _request(tmp_path, report=_forged_database_report())
+
+    with pytest.raises(ValueError, match="reconciliation.*inconsistent"):
+        build_candidate(request)
+
+    assert not request.output.exists()
+
+
+def test_independent_validation_rejects_forged_omitted_database_conflict(
+    tmp_path: Path,
+) -> None:
+    """Catches checksummed receipts trusting omitted conflicts during validation."""
+    result = build_candidate(_request(tmp_path))
+    forged = _forged_database_report()
+    reconciliation_path = result.root / "receipts/RECONCILIATION.json"
+    preflight_path = result.root / "receipts/PREFLIGHT.json"
+    document_inputs_path = result.root / "receipts/DOCUMENT_INPUTS.json"
+    manifest_path = result.root / "MANIFEST.json"
+    reconciliation = forged.to_dict()
+    preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+    preflight["evidence_references"] = sorted(
+        {
+            *preflight["evidence_references"],
+            *(
+                f"{claim.source_ref}#{claim.claim_id}"
+                for claim in forged.claims
+                if claim.claim_id.startswith("claim-db-")
+            ),
+        }
+    )
+    reconciliation_path.write_text(json.dumps(reconciliation), encoding="utf-8")
+    preflight_path.write_text(json.dumps(preflight), encoding="utf-8")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    document_inputs = json.loads(document_inputs_path.read_text(encoding="utf-8"))
+    identity = {
+        key: manifest[key]
+        for key in ("package_id", "project_id", "created_at", "status", "readiness")
+    }
+    rendered = _render_documents_from_structured_inputs(
+        identity, reconciliation, preflight, document_inputs
+    )
+    for relative_path, text in rendered.items():
+        (result.root / relative_path).write_text(text, encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("reconciliation consistency" in item for item in validation.violations)
 
 
 def test_three_generation_lineage_preserves_roots_and_direct_parents(tmp_path: Path) -> None:

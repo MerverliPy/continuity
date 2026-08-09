@@ -4,7 +4,11 @@ from collections.abc import Iterable, Mapping
 import json
 
 from .models import EvidenceState, PreflightDecision, ReadinessStatus
-from .reconciliation import ReconciliationReport, integrity_digest_is_coherent
+from .reconciliation import (
+    ReconciliationReport,
+    integrity_digest_is_coherent,
+    reconciliation_consistency_violations,
+)
 
 
 _PROJECT_FIELDS = frozenset(
@@ -81,6 +85,10 @@ def classify_readiness(
     def block(reason: str) -> None:
         reasons.add(reason)
         blocking_reasons.add(reason)
+
+    # Reconciliation gate: all authority-bearing derived fields are recomputed.
+    for violation in reconciliation_consistency_violations(report):
+        block(f"reconciliation consistency gate: {violation}")
 
     # Integrity gate: readiness requires affirmative structural and lineage evidence.
     if not report.findings:

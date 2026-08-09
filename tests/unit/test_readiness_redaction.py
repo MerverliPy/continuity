@@ -11,7 +11,12 @@ from continuity.models import (
     ReadinessStatus,
 )
 from continuity.readiness import classify_readiness
-from continuity.reconciliation import IntegrityFinding, ReconciliationReport
+from continuity.reconciliation import (
+    IntegrityFinding,
+    ReconciliationReport,
+    conflict_id_for,
+    reconcile_sources,
+)
 from continuity.redaction import exclude_secret_bearing_files, redact_text
 
 
@@ -112,6 +117,11 @@ _NON_BLOCKING_UNKNOWN = _claim(
     state=EvidenceState.UNRESOLVED,
 )
 _SECOND_PROJECT = _claim("project-beta", "project id", "beta")
+_ARCHITECTURE_CLAIMS = (
+    _claim("claim-monolith", "architecture", "monolith"),
+    _claim("claim-services", "architecture", "services"),
+)
+_ARCHITECTURE_CONFLICT_ID = conflict_id_for("architecture", _ARCHITECTURE_CLAIMS)
 
 
 def test_preflight_record_serializes_the_exact_v1_contract() -> None:
@@ -225,6 +235,23 @@ def test_readiness_uses_explicit_gates(
         assert "implementation" in decision.authorized_actions
         assert decision.unresolved_actions == ()
         assert decision.exact_next_action == "implementation"
+
+
+def test_readiness_blocks_forged_omitted_database_conflict() -> None:
+    """Catches a forged conflict-free report enabling execution recommendations."""
+    postgres = _claim("claim-db-postgres", "database", "PostgreSQL")
+    sqlite = _claim("claim-db-sqlite", "database", "SQLite")
+    forged = _report(
+        extra_claims=(postgres, sqlite),
+        extra_selected=(postgres.claim_id, sqlite.claim_id),
+    )
+
+    decision = classify_readiness(forged, "implementation")
+
+    assert decision.status is ReadinessStatus.BLOCKED
+    assert decision.authorized_actions == ()
+    assert decision.companion_skill_or_stage is None
+    assert any("reconciliation consistency" in reason for reason in decision.reasons)
 
 
 @pytest.mark.parametrize(
@@ -341,27 +368,13 @@ def test_blank_requested_action_has_explicit_stable_prohibition() -> None:
 def _report_with_material_resolution(
     approval: ApprovalRecord | None,
 ) -> ReconciliationReport:
-    selected = _claim("claim-monolith", "architecture", "monolith")
-    competing = _claim("claim-services", "architecture", "services")
-    conflict = ConflictRecord(
-        "conflict-resolved-architecture",
-        "architecture",
-        True,
-        (selected.claim_id, competing.claim_id),
-        "approval-resolution",
-    )
     report = _report(
-        conflicts=(conflict,),
-        extra_claims=(selected, competing),
-        extra_selected=(selected.claim_id,),
+        extra_claims=_ARCHITECTURE_CLAIMS,
     )
-    return ReconciliationReport(
-        claims=report.claims,
-        approvals=() if approval is None else (approval,),
-        findings=report.findings,
-        conflicts=report.conflicts,
-        selected_claim_ids=report.selected_claim_ids,
-        notes=report.notes,
+    return reconcile_sources(
+        report.claims,
+        () if approval is None else (approval,),
+        report.findings,
     )
 
 
@@ -372,7 +385,7 @@ def _report_with_material_resolution(
         ApprovalRecord(
             "approval-resolution",
             "approve-claim",
-            ("conflict-resolved-architecture",),
+            (_ARCHITECTURE_CONFLICT_ID,),
             "claim-monolith",
             "user",
             "approval.md",
@@ -390,7 +403,7 @@ def _report_with_material_resolution(
         ApprovalRecord(
             "approval-resolution",
             "resolve-conflict",
-            ("conflict-resolved-architecture",),
+            (_ARCHITECTURE_CONFLICT_ID,),
             "claim-unrelated",
             "user",
             "approval.md",
@@ -417,7 +430,7 @@ def test_exact_material_resolution_approval_is_accepted() -> None:
     approval = ApprovalRecord(
         "approval-resolution",
         "resolve-conflict",
-        ("conflict-resolved-architecture",),
+        (_ARCHITECTURE_CONFLICT_ID,),
         "claim-monolith",
         "user",
         "approval.md",

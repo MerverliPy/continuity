@@ -8,20 +8,6 @@ from typing import Sequence
 from .models import ApprovalRecord, ClaimRecord, ConflictRecord, EvidenceState
 
 
-_MATERIAL_FIELDS = frozenset(
-    {
-        "architecture",
-        "behavior",
-        "scope",
-        "authority",
-        "safety",
-        "release",
-        "release readiness",
-        "next action",
-    }
-)
-
-
 @dataclass(frozen=True)
 class IntegrityFinding:
     """Structural, checksum, and lineage evidence for one source."""
@@ -232,7 +218,9 @@ def reconcile_sources(
             selected.update(claim.claim_id for claim in field_claims)
             continue
 
-        material = _is_material_field(normalized_field)
+        # No evidence-backed non-material classification exists in v1. Any
+        # genuinely different semantic value is therefore material by default.
+        material = True
         conflict_id = conflict_id_for(normalized_field, field_claims)
         resolution_id: str | None = None
 
@@ -253,9 +241,6 @@ def reconcile_sources(
                 for approval in exact_resolutions
                 if approval.decision in decisions
             )
-        elif not material:
-            selected.update(claim.claim_id for claim in field_claims)
-
         conflicts.append(
             ConflictRecord(
                 conflict_id=conflict_id,
@@ -280,13 +265,45 @@ def reconcile_sources(
     )
 
 
+def reconciliation_consistency_violations(
+    report: ReconciliationReport,
+) -> tuple[str, ...]:
+    """Recompute every derived authority field and report any divergence."""
+
+    try:
+        canonical = reconcile_sources(report.claims, report.approvals, report.findings)
+        declared_selected = tuple(sorted(report.selected_claim_ids))
+        canonical_selected = canonical.selected_claim_ids
+        declared_conflicts = tuple(
+            sorted(report.conflicts, key=lambda conflict: conflict.conflict_id)
+        )
+        declared_blocking = tuple(
+            sorted(conflict.conflict_id for conflict in report.blocking_conflicts)
+        )
+        canonical_blocking = tuple(
+            sorted(conflict.conflict_id for conflict in canonical.blocking_conflicts)
+        )
+        declared_notes = tuple(sorted(report.notes))
+    except (AttributeError, TypeError, ValueError):
+        return ("reconciliation inputs cannot be canonically recomputed",)
+
+    violations: list[str] = []
+    if (
+        len(report.selected_claim_ids) != len(set(report.selected_claim_ids))
+        or declared_selected != canonical_selected
+    ):
+        violations.append("selected claims do not match canonical reconciliation")
+    if declared_conflicts != canonical.conflicts:
+        violations.append("conflicts do not match canonical reconciliation")
+    if declared_blocking != canonical_blocking:
+        violations.append("blocking conflicts do not match canonical reconciliation")
+    if declared_notes != canonical.notes:
+        violations.append("notes do not match canonical reconciliation")
+    return tuple(violations)
+
+
 def _normalize_field(field: str) -> str:
     return " ".join(field.replace("_", " ").replace("-", " ").casefold().split())
-
-
-def _is_material_field(field: str) -> bool:
-    padded_field = f" {field} "
-    return any(f" {material} " in padded_field for material in _MATERIAL_FIELDS)
 
 
 def _normalized_value(value: object) -> str:
