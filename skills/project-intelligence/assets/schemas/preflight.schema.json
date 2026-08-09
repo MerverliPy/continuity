@@ -28,7 +28,7 @@
     },
     "reasons": {"$ref": "#/$defs/nonemptyStringList"},
     "conditions": {"$ref": "#/$defs/stringList"},
-    "authorized_actions": {"$ref": "#/$defs/nonemptyStringList"},
+    "authorized_actions": {"$ref": "#/$defs/stringList"},
     "prohibited_actions": {"$ref": "#/$defs/nonemptyStringList"},
     "unresolved_actions": {"$ref": "#/$defs/stringList"},
     "exact_next_action": {
@@ -48,12 +48,17 @@
       },
       "then": {
         "properties": {
+          "authorized_actions": {"maxItems": 0},
+          "unresolved_actions": {"minItems": 1},
           "exact_next_action": {"type": "null"},
           "companion_skill_or_stage": {"type": "null"}
         }
       },
       "else": {
-        "properties": {"exact_next_action": {"type": "string", "minLength": 1}}
+        "properties": {
+          "authorized_actions": {"minItems": 1},
+          "exact_next_action": {"type": "string", "minLength": 1}
+        }
       }
     }
   ],

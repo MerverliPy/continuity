@@ -134,6 +134,20 @@ def _minimal_build_request(canonical_files: dict[str, str]) -> dict[str, object]
         },
         "canonical_files": canonical_files,
         "rendered_documents": {path: "state\n" for path in DOCUMENT_PATHS},
+        "preflight_decision": {
+            "schema": "continuity.preflight/v1",
+            "project_id": "alpha",
+            "package_id": "overlap",
+            "status": "Ready",
+            "reasons": ["all readiness gates passed"],
+            "conditions": [],
+            "authorized_actions": ["implementation"],
+            "prohibited_actions": ["actions outside recorded authorization"],
+            "unresolved_actions": [],
+            "exact_next_action": "implementation",
+            "companion_skill_or_stage": "superpowers:test-driven-development",
+            "evidence_references": ["HANDOFF.md#claim-project"],
+        },
         "lineage_data": {},
         "evidence_index": {},
         "secure_handling_approvals": [],
@@ -227,6 +241,24 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     )
 
     candidate_id = "candidate-alpha"
+    preflight_input = _json_file(
+        tmp_path / "preflight-input.json", reconciliation["report"]
+    )
+    candidate_preflight, _ = _run(
+        wrapper,
+        "preflight",
+        "--reconciliation",
+        preflight_input,
+        "--project-id",
+        "alpha",
+        "--package-id",
+        candidate_id,
+        "--requested-action",
+        "implementation",
+        "--output",
+        tmp_path / "candidate-preflight.json",
+        expected=0,
+    )
     selected_hashes = {
         source_id: str(result["source"]["sha256"])
         for source_id, result in inspect_results.items()
@@ -243,6 +275,7 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
             "rendered_documents": {
                 path: f"# {path}\n\nVerified Continuity state.\n" for path in DOCUMENT_PATHS
             },
+            "preflight_decision": candidate_preflight,
             "lineage_data": {
                 "schema": "continuity.lineage/v1",
                 "package_id": candidate_id,
@@ -376,25 +409,30 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     assert wrapped_inspection["integrity"]["evidence_state"] == "Verified"
     assert wrapped_inspection["archive"]["code"] == "package-verified"
 
-    preflight_input = _json_file(
-        tmp_path / "preflight-input.json", reconciliation["report"]
-    )
     preflight, _ = _run(
         wrapper,
         "preflight",
         "--reconciliation",
         preflight_input,
+        "--project-id",
+        "alpha",
+        "--package-id",
+        canonical_id,
         "--requested-action",
         "implementation",
         "--output",
         tmp_path / "preflight.json",
         expected=0,
     )
-    assert preflight["decision"]["status"] == "Ready"
-    assert preflight["decision"]["exact_next_action"] == "implementation"
-    assert preflight["decision"]["recommended_superpowers_skill"] == (
+    assert preflight["schema"] == "continuity.preflight/v1"
+    assert preflight["project_id"] == "alpha"
+    assert preflight["package_id"] == canonical_id
+    assert preflight["status"] == "Ready"
+    assert preflight["exact_next_action"] == "implementation"
+    assert preflight["companion_skill_or_stage"] == (
         "superpowers:test-driven-development"
     )
+    assert "recommended_superpowers_skill" not in preflight
     assert _snapshot(older) == sources_before["older"]
     assert _snapshot(newer) == sources_before["newer"]
     assert _snapshot(candidate_release) == candidate_before
@@ -449,6 +487,22 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
     assert reconciled["report"]["blocking_conflict_ids"]
 
     blocked_id = "candidate-blocked"
+    preflight_input = _json_file(tmp_path / "blocked-input.json", reconciled["report"])
+    blocked_preflight, _ = _run(
+        wrapper,
+        "preflight",
+        "--reconciliation",
+        preflight_input,
+        "--project-id",
+        "alpha",
+        "--package-id",
+        blocked_id,
+        "--requested-action",
+        "implementation",
+        "--output",
+        tmp_path / "blocked-preflight.json",
+        expected=2,
+    )
     selected_hashes = {
         source_id: _tree_sha256(source)
         for source_id, source in (("left", left), ("right", right))
@@ -465,6 +519,7 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
             "rendered_documents": {
                 path: f"# {path}\n\nBlocked Continuity state.\n" for path in DOCUMENT_PATHS
             },
+            "preflight_decision": blocked_preflight,
             "lineage_data": {
                 "schema": "continuity.lineage/v1",
                 "package_id": blocked_id,
@@ -527,21 +582,12 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
     assert _snapshot(left) == sources_before["left"]
     assert _snapshot(right) == sources_before["right"]
 
-    preflight_input = _json_file(tmp_path / "blocked-input.json", reconciled["report"])
-    blocked, _ = _run(
-        wrapper,
-        "preflight",
-        "--reconciliation",
-        preflight_input,
-        "--requested-action",
-        "implementation",
-        "--output",
-        tmp_path / "blocked-preflight.json",
-        expected=2,
-    )
-    assert blocked["decision"]["status"] == "Blocked"
-    assert blocked["decision"]["exact_next_action"] is None
-    assert blocked["decision"]["recommended_superpowers_skill"] is None
+    blocked = blocked_preflight
+    assert blocked["schema"] == "continuity.preflight/v1"
+    assert blocked["status"] == "Blocked"
+    assert blocked["authorized_actions"] == []
+    assert blocked["exact_next_action"] is None
+    assert blocked["companion_skill_or_stage"] is None
     assert blocked_release.exists()
     assert not canonical_release.exists()
 
@@ -677,6 +723,35 @@ def test_build_output_may_not_contain_a_canonical_source(
 
     assert payload["error"]["code"] == "invalid_input"
     assert source.read_bytes() == before
+
+
+def test_build_rejects_legacy_or_unknown_preflight_fields(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches an alternate companion field bypassing the exact v1 adapter."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    value = _minimal_build_request({})
+    preflight = dict(value["preflight_decision"])
+    preflight["recommended_superpowers_skill"] = preflight.pop(
+        "companion_skill_or_stage"
+    )
+    value["preflight_decision"] = preflight
+    request = _json_file(tmp_path / "legacy-preflight.json", value)
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        tmp_path / "release",
+        expected=1,
+    )
+
+    assert payload["error"]["message"] == (
+        "preflight_decision has missing or unknown fields"
+    )
+    assert not (tmp_path / "release").exists()
 
 
 def test_build_output_may_not_be_beneath_single_source_tree(
@@ -992,6 +1067,20 @@ def test_runtime_publication_failure_is_stable_json(
             },
             "canonical_files": {},
             "rendered_documents": {path: "state\n" for path in DOCUMENT_PATHS},
+            "preflight_decision": {
+                "schema": "continuity.preflight/v1",
+                "project_id": "alpha",
+                "package_id": "candidate",
+                "status": "Ready",
+                "reasons": ["all readiness gates passed"],
+                "conditions": [],
+                "authorized_actions": ["implementation"],
+                "prohibited_actions": ["actions outside recorded authorization"],
+                "unresolved_actions": [],
+                "exact_next_action": "implementation",
+                "companion_skill_or_stage": "superpowers:test-driven-development",
+                "evidence_references": ["HANDOFF.md#claim-project"],
+            },
             "lineage_data": {}, "evidence_index": {}, "secure_handling_approvals": [],
             "readiness": "Ready", "allow_conditional_promotion": False,
         },

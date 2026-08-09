@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import continuity.models as continuity_models
 
 from continuity.models import (
     ApprovalRecord,
@@ -110,6 +111,35 @@ _NON_BLOCKING_UNKNOWN = _claim(
 _SECOND_PROJECT = _claim("project-beta", "project id", "beta")
 
 
+def test_preflight_record_serializes_the_exact_v1_contract() -> None:
+    """Catches typed readiness drifting from the schema and CLI field names."""
+    record_type = getattr(continuity_models, "PreflightRecord", None)
+    assert record_type is not None
+    decision = classify_readiness(_report(), "implementation")
+
+    record = record_type.from_decision(decision, "alpha", "canonical-alpha")
+
+    assert record.to_dict() == {
+        "schema": "continuity.preflight/v1",
+        "project_id": "alpha",
+        "package_id": "canonical-alpha",
+        "status": "Ready",
+        "reasons": ["all readiness gates passed"],
+        "conditions": [],
+        "authorized_actions": ["implementation"],
+        "prohibited_actions": ["actions outside recorded authorization"],
+        "unresolved_actions": [],
+        "exact_next_action": "implementation",
+        "companion_skill_or_stage": "superpowers:test-driven-development",
+        "evidence_references": [
+            "manifest.json#/authority-alpha#authority-alpha",
+            "manifest.json#/lifecycle-alpha#lifecycle-alpha",
+            "manifest.json#/project-alpha#project-alpha",
+            "receipts/RECONCILIATION.json#integrity-canonical",
+        ],
+    }
+
+
 @pytest.mark.parametrize(
     ("report", "expected"),
     (
@@ -154,14 +184,16 @@ def test_readiness_uses_explicit_gates(
 
     assert decision.status is expected
     assert decision.reasons == tuple(sorted(decision.reasons))
-    assert decision.authorized_actions
     assert decision.prohibited_actions
     if expected is ReadinessStatus.BLOCKED:
+        assert decision.authorized_actions == ()
+        assert decision.unresolved_actions
         assert "implementation" in decision.prohibited_actions
         assert decision.exact_next_action is None
-        assert decision.recommended_superpowers_skill is None
+        assert decision.companion_skill_or_stage is None
     else:
         assert "implementation" in decision.authorized_actions
+        assert decision.unresolved_actions == ()
         assert decision.exact_next_action == "implementation"
 
 

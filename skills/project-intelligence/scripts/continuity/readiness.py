@@ -195,7 +195,6 @@ def classify_readiness(
             )
 
     if blocking_reasons:
-        safe_actions = ("clarify readiness blockers",)
         blocked_actions = set(prohibited)
         if requested_action:
             blocked_actions.add(requested_action)
@@ -205,10 +204,12 @@ def classify_readiness(
             status=ReadinessStatus.BLOCKED,
             reasons=tuple(sorted(reasons)),
             conditions=tuple(sorted(conditions)),
-            authorized_actions=safe_actions,
+            authorized_actions=(),
             prohibited_actions=tuple(sorted(blocked_actions, key=_normalize)),
+            unresolved_actions=("clarify readiness blockers",),
             exact_next_action=None,
-            recommended_superpowers_skill=None,
+            companion_skill_or_stage=None,
+            evidence_references=_evidence_references(report),
         )
 
     if conditions:
@@ -226,9 +227,30 @@ def classify_readiness(
         conditions=tuple(sorted(conditions)),
         authorized_actions=tuple(sorted(authorized, key=_normalize)),
         prohibited_actions=tuple(sorted(prohibited, key=_normalize)),
+        unresolved_actions=(),
         exact_next_action=requested_action,
-        recommended_superpowers_skill=_RECOMMENDED_SKILLS.get(normalized_requested),
+        companion_skill_or_stage=_RECOMMENDED_SKILLS.get(normalized_requested),
+        evidence_references=_evidence_references(report),
     )
+
+
+def _evidence_references(report: ReconciliationReport) -> tuple[str, ...]:
+    references = {
+        f"{claim.source_ref}#{claim.claim_id}"
+        for claim in report.claims
+        if claim.source_ref.strip() and claim.claim_id.strip()
+    }
+    references.update(
+        f"{approval.source_ref}#{approval.approval_id}"
+        for approval in report.approvals
+        if approval.source_ref.strip() and approval.approval_id.strip()
+    )
+    references.update(
+        f"receipts/RECONCILIATION.json#{finding.finding_id}"
+        for finding in report.findings
+        if finding.finding_id.strip()
+    )
+    return tuple(sorted(references))
 
 
 def _actions_from_claims(claims: Iterable[object], fields: frozenset[str]) -> set[str]:

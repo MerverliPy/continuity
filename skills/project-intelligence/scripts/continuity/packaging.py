@@ -18,10 +18,19 @@ import tempfile
 import zipfile
 
 from .hashing import inventory_tree, sha256_file, verify_sha256s, write_sha256s
-from .models import ApprovalRecord, EvidenceState, PackageStatus, ReadinessStatus
+from .models import (
+    ApprovalRecord,
+    ClaimRecord,
+    ConflictRecord,
+    EvidenceState,
+    PackageStatus,
+    PreflightRecord,
+    ReadinessStatus,
+)
 from .paths import normalize_relative_path
-from .reconciliation import ReconciliationReport
+from .reconciliation import IntegrityFinding, ReconciliationReport
 from .redaction import redact_text
+from .readiness import classify_readiness
 
 
 _DOCUMENT_PATHS = (
@@ -40,6 +49,7 @@ _REQUIRED_FILES = frozenset(
         "lineage/LINEAGE.json",
         "evidence/INDEX.json",
         "receipts/RECONCILIATION.json",
+        "receipts/PREFLIGHT.json",
         "MANIFEST.json",
         "SHA256SUMS.txt",
     }
@@ -60,9 +70,10 @@ _SCHEMA_PATHS = {
     "lineage": _ASSETS_ROOT / "schemas/lineage.schema.json",
     "evidence": _ASSETS_ROOT / "schemas/evidence-index.schema.json",
     "reconciliation": _ASSETS_ROOT / "schemas/reconciliation.schema.json",
+    "preflight": _ASSETS_ROOT / "schemas/preflight.schema.json",
 }
 _TEMPLATE_ROOT = _ASSETS_ROOT / "templates"
-_TEMPLATE_TOKEN = re.compile(r"{{\s*([a-z][a-z0-9_]*)\s*}}")
+_TEMPLATE_TOKEN_CONTENT = re.compile(r"\s*([a-z][a-z0-9_]*)\s*")
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,7 @@ class CandidateBuildRequest:
     approved_reconciliation_report: ReconciliationReport
     canonical_files: Mapping[str, Path]
     rendered_documents: Mapping[str, str]
+    preflight_decision: PreflightRecord
     lineage_data: Mapping[str, object]
     evidence_index: Mapping[str, object]
     secure_handling_approvals: Sequence[ApprovalRecord]
@@ -156,6 +168,10 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
             package_root / "receipts/RECONCILIATION.json",
             request.approved_reconciliation_report.to_dict(),
         )
+        _write_json_new(
+            package_root / "receipts/PREFLIGHT.json",
+            request.preflight_decision.to_dict(),
+        )
         artifact_violations: list[str] = []
         _validate_json_artifacts(package_root, artifact_violations, include_manifest=False)
         if artifact_violations:
@@ -176,6 +192,7 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
         )
         artifact_violations = []
         _validate_json_artifacts(package_root, artifact_violations, include_manifest=True)
+        _validate_completed_documents(package_root, artifact_violations)
         if artifact_violations:
             raise ValueError(
                 "structured package artifacts are invalid: "
@@ -245,11 +262,17 @@ def validate_package(root: Path) -> PackageValidation:
         "receipts/RECONCILIATION.json",
         violations,
     )
+    preflight = _read_json_object(
+        root / "receipts/PREFLIGHT.json",
+        "receipts/PREFLIGHT.json",
+        violations,
+    )
     manifest = _read_json_object(root / "MANIFEST.json", "MANIFEST.json", violations)
     for artifact, schema_name, label in (
         (lineage, "lineage", "lineage"),
         (evidence_index, "evidence", "evidence"),
         (reconciliation, "reconciliation", "reconciliation"),
+        (preflight, "preflight", "preflight"),
         (manifest, "manifest", "manifest"),
     ):
         if artifact is not None:
@@ -302,6 +325,16 @@ def validate_package(root: Path) -> PackageValidation:
     if reconciliation is not None:
         _validate_reconciliation_structure(reconciliation, violations)
         _validate_selected_project_identity(reconciliation, project_id, violations)
+    if preflight is not None and manifest is not None:
+        if preflight.get("project_id") != project_id:
+            violations.append("preflight project_id does not match manifest")
+        if preflight.get("package_id") != package_id:
+            violations.append("preflight package_id does not match manifest")
+        if preflight.get("status") != manifest.get("readiness"):
+            violations.append("preflight readiness does not match manifest")
+    if reconciliation is not None and preflight is not None:
+        if not _serialized_preflight_matches_report(preflight, reconciliation):
+            violations.append("preflight authority does not match reconciliation")
     if (
         reconciliation is not None
         and reconciliation.get("blocking_conflict_ids")
@@ -335,6 +368,15 @@ def validate_package(root: Path) -> PackageValidation:
         )
         if promotion is not None:
             _validate_promotion_receipt(promotion, package_id, violations)
+
+    if manifest is not None and reconciliation is not None and preflight is not None:
+        _validate_document_contracts(
+            root,
+            manifest,
+            reconciliation,
+            preflight,
+            violations,
+        )
 
     checksum_path = root / "SHA256SUMS.txt"
     if not _is_regular_file(checksum_path):
@@ -424,6 +466,13 @@ def promote_candidate(
             successor_created_at=successor_created_at,
             readiness=validation.readiness,
         )
+        _update_successor_preflight(
+            successor_root / "receipts/PREFLIGHT.json",
+            successor_root / "SUPERPOWERS_PREFLIGHT.md",
+            successor_root / "NEXT_THREAD_PROMPT.txt",
+            candidate_id=validation.package_id,
+            successor_id=successor_id,
+        )
         successor_lineage = json.loads(
             (successor_root / "lineage/LINEAGE.json").read_text(encoding="utf-8")
         )
@@ -442,6 +491,7 @@ def promote_candidate(
         )
         artifact_violations: list[str] = []
         _validate_json_artifacts(successor_root, artifact_violations, include_manifest=True)
+        _validate_completed_documents(successor_root, artifact_violations)
         if artifact_violations:
             raise ValueError(
                 "promoted structured artifacts are invalid: "
@@ -482,6 +532,12 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         raise ValueError("rendered documents must contain exactly the v1 document paths")
     if any(not isinstance(text, str) or not text.strip() for text in request.rendered_documents.values()):
         raise ValueError("rendered documents must be non-empty text")
+    if not isinstance(request.preflight_decision, PreflightRecord):
+        raise ValueError("preflight_decision must be a PreflightRecord")
+    if request.preflight_decision.project_id != request.project_id:
+        raise ValueError("preflight project_id must match request project_id")
+    if request.preflight_decision.package_id != request.package_id:
+        raise ValueError("preflight package_id must match request package_id")
     if not isinstance(request.readiness, ReadinessStatus):
         raise ValueError("readiness must be a ReadinessStatus")
     if not isinstance(request.allow_conditional_promotion, bool):
@@ -525,6 +581,21 @@ def _validate_request(request: CandidateBuildRequest) -> None:
     )
     if reconciliation_violations:
         raise ValueError(reconciliation_violations[0])
+    effective_readiness = (
+        ReadinessStatus.BLOCKED
+        if request.approved_reconciliation_report.blocking_conflicts
+        else request.readiness
+    )
+    if request.preflight_decision.status is not effective_readiness:
+        raise ValueError("preflight status must match request readiness")
+    preflight_violations = validate_preflight_record(request.preflight_decision)
+    if preflight_violations:
+        raise ValueError(preflight_violations[0])
+    if not _preflight_matches_report(
+        request.preflight_decision,
+        request.approved_reconciliation_report,
+    ):
+        raise ValueError("preflight_decision does not match reconciliation authority")
     try:
         json.dumps(request.lineage_data)
         json.dumps(request.evidence_index)
@@ -547,6 +618,12 @@ def _render_documents(
     status: PackageStatus,
     readiness: ReadinessStatus,
 ) -> dict[str, str]:
+    report = request.approved_reconciliation_report
+    preflight = request.preflight_decision
+    claim_rows = _selected_claim_rows(report)
+    approval_rows = _approval_rows(report)
+    conflict_rows = _conflict_rows(report)
+    unresolved_rows = _unresolved_rows(report, preflight)
     token_values = {
         "HANDOFF_README.md": {
             "package_id": request.package_id,
@@ -554,27 +631,56 @@ def _render_documents(
             "created_at": request.created_at,
             "status": status.value,
             "readiness": readiness.value,
-            "handoff_body": request.rendered_documents["HANDOFF_README.md"],
+            "supplemental_narrative": request.rendered_documents["HANDOFF_README.md"],
         },
         "CANONICAL_STATE.md": {
-            "canonical_state": request.rendered_documents["CANONICAL_STATE.md"]
+            "selected_claim_records": "\n".join(claim_rows),
+            "supplemental_narrative": request.rendered_documents["CANONICAL_STATE.md"],
         },
         "AUTHORITY_LEDGER.md": {
-            "authority_records": request.rendered_documents["AUTHORITY_LEDGER.md"]
+            "approval_records": "\n".join(approval_rows),
+            "allowed_actions": _markdown_list(preflight.authorized_actions),
+            "prohibited_actions": _markdown_list(preflight.prohibited_actions),
+            "unresolved_actions": _markdown_list(preflight.unresolved_actions),
+            "supplemental_narrative": request.rendered_documents["AUTHORITY_LEDGER.md"],
         },
         "CONFLICT_RESOLUTIONS.md": {
-            "conflict_resolutions": request.rendered_documents[
+            "conflict_records": "\n".join(conflict_rows),
+            "supplemental_narrative": request.rendered_documents[
                 "CONFLICT_RESOLUTIONS.md"
-            ]
+            ],
         },
         "UNRESOLVED.md": {
-            "unresolved_records": request.rendered_documents["UNRESOLVED.md"]
+            "unresolved_records": "\n".join(unresolved_rows),
+            "unresolved_summary": _unresolved_summary(report, preflight),
+            "supplemental_narrative": request.rendered_documents["UNRESOLVED.md"],
         },
         "NEXT_THREAD_PROMPT.txt": {
-            "next_thread_prompt": request.rendered_documents["NEXT_THREAD_PROMPT.txt"]
+            "project_id": request.project_id,
+            "package_id": request.package_id,
+            "readiness": preflight.status.value,
+            "exact_next_action": _display_optional(preflight.exact_next_action),
+            "supplemental_narrative": request.rendered_documents[
+                "NEXT_THREAD_PROMPT.txt"
+            ],
         },
         "SUPERPOWERS_PREFLIGHT.md": {
-            "preflight_body": request.rendered_documents["SUPERPOWERS_PREFLIGHT.md"]
+            "project_id": preflight.project_id,
+            "package_id": preflight.package_id,
+            "readiness": preflight.status.value,
+            "exact_next_action": _display_optional(preflight.exact_next_action),
+            "companion_skill_or_stage": _display_optional(
+                preflight.companion_skill_or_stage
+            ),
+            "reasons": _markdown_list(preflight.reasons),
+            "conditions": _markdown_list(preflight.conditions),
+            "authorized_actions": _markdown_list(preflight.authorized_actions),
+            "prohibited_actions": _markdown_list(preflight.prohibited_actions),
+            "unresolved_actions": _markdown_list(preflight.unresolved_actions),
+            "evidence_references": _markdown_list(preflight.evidence_references),
+            "supplemental_narrative": request.rendered_documents[
+                "SUPERPOWERS_PREFLIGHT.md"
+            ],
         },
     }
     rendered: dict[str, str] = {}
@@ -584,6 +690,367 @@ def _render_documents(
         if not rendered[document_path].strip():
             raise ValueError(f"rendered template is empty: {document_path}")
     return rendered
+
+
+def _selected_claim_rows(report: ReconciliationReport | Mapping[str, object]) -> list[str]:
+    claims, selected = _report_claims_and_selected(report)
+    rows = [
+        "| "
+        + " | ".join(
+            (
+                _markdown_text(claim["field"]),
+                _markdown_value(claim["value"]),
+                _markdown_text(claim["evidence_state"]),
+                _markdown_text(
+                    f'{claim["source_id"]} — {claim["source_ref"]}'
+                ),
+                _markdown_text(claim["claim_id"]),
+            )
+        )
+        + " |"
+        for claim in claims
+        if claim.get("claim_id") in selected
+    ]
+    return rows or [
+        "| No selected claims | null | Missing | "
+        "receipts/RECONCILIATION.json | selected-claims-missing |"
+    ]
+
+
+def _approval_rows(report: ReconciliationReport | Mapping[str, object]) -> list[str]:
+    approvals = _report_records(report, "approvals")
+    rows = [
+        "| "
+        + " | ".join(
+            (
+                _markdown_text(f'{item["action"]}: {item["decision"]}'),
+                _markdown_value(item["scope"]),
+                EvidenceState.ASSERTED.value,
+                _markdown_text(f'{item["source_id"]} — {item["source_ref"]}'),
+                _markdown_text(item["approval_id"]),
+            )
+        )
+        + " |"
+        for item in approvals
+    ]
+    return rows or [
+        "| No approvals recorded | [] | Missing | "
+        "receipts/RECONCILIATION.json | approvals-missing |"
+    ]
+
+
+def _conflict_rows(report: ReconciliationReport | Mapping[str, object]) -> list[str]:
+    conflicts = _report_records(report, "conflicts")
+    approvals = {
+        item.get("approval_id"): item for item in _report_records(report, "approvals")
+    }
+    rows: list[str] = []
+    for item in conflicts:
+        resolution_id = item.get("resolution_approval_id")
+        approval = approvals.get(resolution_id)
+        source = (
+            f'{approval["source_id"]} — {approval["source_ref"]}'
+            if approval is not None
+            else "receipts/RECONCILIATION.json"
+        )
+        state = "Resolved" if resolution_id is not None else "Unresolved"
+        rows.append(
+            "| "
+            + " | ".join(
+                (
+                    _markdown_text(item["field"]),
+                    _markdown_value(item["claim_ids"]),
+                    state if item.get("material") is True else "Non-material",
+                    _markdown_text(resolution_id or "Unresolved"),
+                    _markdown_text(source),
+                    _markdown_text(item["conflict_id"]),
+                )
+            )
+            + " |"
+        )
+    return rows or [
+        "| No conflicts recorded | [] | Non-material | Unresolved | "
+        "receipts/RECONCILIATION.json | conflicts-none |"
+    ]
+
+
+def _unresolved_rows(
+    report: ReconciliationReport | Mapping[str, object],
+    preflight: PreflightRecord | Mapping[str, object],
+) -> list[str]:
+    rows: list[str] = []
+    for claim in _report_records(report, "claims"):
+        state = claim.get("evidence_state")
+        if state not in {
+            EvidenceState.UNRESOLVED.value,
+            EvidenceState.CONTRADICTED.value,
+            EvidenceState.MISSING.value,
+        }:
+            continue
+        rows.append(
+            _unresolved_row(
+                claim.get("field"),
+                "May change an authorized next action",
+                state,
+                f'{claim.get("source_id")} — {claim.get("source_ref")}',
+                claim.get("claim_id"),
+            )
+        )
+    for finding in _report_records(report, "findings"):
+        if (
+            finding.get("evidence_state") == EvidenceState.VERIFIED.value
+            and finding.get("structurally_valid") is not False
+            and finding.get("lineage_valid") is not False
+        ):
+            continue
+        rows.append(
+            _unresolved_row(
+                finding.get("detail") or "integrity finding",
+                "Blocks trusted package use",
+                finding.get("evidence_state"),
+                "receipts/RECONCILIATION.json",
+                finding.get("finding_id"),
+            )
+        )
+    for conflict in _report_records(report, "conflicts"):
+        if conflict.get("material") is True and conflict.get(
+            "resolution_approval_id"
+        ) is None:
+            rows.append(
+                _unresolved_row(
+                    conflict.get("field"),
+                    "Blocks promotion and execution",
+                    EvidenceState.UNRESOLVED.value,
+                    "receipts/RECONCILIATION.json",
+                    conflict.get("conflict_id"),
+                )
+            )
+    for index, action in enumerate(_preflight_value(preflight, "unresolved_actions")):
+        rows.append(
+            _unresolved_row(
+                action,
+                "Requires readiness clarification",
+                EvidenceState.UNRESOLVED.value,
+                "receipts/PREFLIGHT.json",
+                f"preflight-unresolved-{index + 1}",
+            )
+        )
+    return rows or [
+        "| No unresolved records | No known impact | Verified | "
+        "receipts/RECONCILIATION.json | unresolved-none |"
+    ]
+
+
+def _unresolved_row(
+    description: object,
+    impact: object,
+    state: object,
+    source: object,
+    record_id: object,
+) -> str:
+    return "| " + " | ".join(
+        _markdown_text(value)
+        for value in (description, impact, state, source, record_id)
+    ) + " |"
+
+
+def _unresolved_summary(
+    report: ReconciliationReport | Mapping[str, object],
+    preflight: PreflightRecord | Mapping[str, object],
+) -> str:
+    record_ids = [
+        row.rsplit(" | ", 2)[1]
+        for row in _unresolved_rows(report, preflight)
+        if "unresolved-none" not in row
+    ]
+    return _markdown_list(record_ids)
+
+
+def _markdown_list(values: Sequence[object]) -> str:
+    return "\n".join(f"- {_markdown_text(value)}" for value in values) or "- None."
+
+
+def _markdown_text(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def _markdown_value(value: object) -> str:
+    return _markdown_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def _display_optional(value: str | None) -> str:
+    return value if value is not None else "null"
+
+
+def _report_mapping(
+    report: ReconciliationReport | Mapping[str, object],
+) -> Mapping[str, object]:
+    return report.to_dict() if isinstance(report, ReconciliationReport) else report
+
+
+def _report_records(
+    report: ReconciliationReport | Mapping[str, object], field: str
+) -> list[Mapping[str, object]]:
+    value = _report_mapping(report).get(field)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _report_claims_and_selected(
+    report: ReconciliationReport | Mapping[str, object],
+) -> tuple[list[Mapping[str, object]], set[object]]:
+    mapping = _report_mapping(report)
+    selected = mapping.get("selected_claim_ids")
+    return (
+        _report_records(mapping, "claims"),
+        set(selected) if isinstance(selected, list) else set(),
+    )
+
+
+def _preflight_mapping(
+    preflight: PreflightRecord | Mapping[str, object],
+) -> Mapping[str, object]:
+    return preflight.to_dict() if isinstance(preflight, PreflightRecord) else preflight
+
+
+def _preflight_value(
+    preflight: PreflightRecord | Mapping[str, object], field: str
+) -> list[object]:
+    value = _preflight_mapping(preflight).get(field)
+    return list(value) if isinstance(value, list) else []
+
+
+def _preflight_matches_report(
+    record: PreflightRecord,
+    report: ReconciliationReport,
+) -> bool:
+    candidate_actions: tuple[str, ...]
+    if record.exact_next_action is not None:
+        candidate_actions = (record.exact_next_action,)
+    else:
+        candidate_actions = (*record.prohibited_actions, "")
+    return any(
+        PreflightRecord.from_decision(
+            classify_readiness(report, action),
+            record.project_id,
+            record.package_id,
+        )
+        == record
+        for action in candidate_actions
+    )
+
+
+def _serialized_preflight_matches_report(
+    preflight: Mapping[str, object], reconciliation: Mapping[str, object]
+) -> bool:
+    """Reapply readiness gates during independent package validation."""
+
+    try:
+        report = ReconciliationReport(
+            claims=tuple(
+                ClaimRecord(
+                    claim_id=str(item["claim_id"]),
+                    field=str(item["field"]),
+                    value=item.get("value"),
+                    source_id=str(item["source_id"]),
+                    source_ref=str(item["source_ref"]),
+                    evidence_state=EvidenceState(str(item["evidence_state"])),
+                    recorded_at=(
+                        str(item["recorded_at"])
+                        if item.get("recorded_at") is not None
+                        else None
+                    ),
+                )
+                for item in _report_records(reconciliation, "claims")
+            ),
+            approvals=tuple(
+                ApprovalRecord(
+                    approval_id=str(item["approval_id"]),
+                    action=str(item["action"]),
+                    scope=tuple(str(value) for value in item["scope"]),
+                    decision=str(item["decision"]),
+                    source_id=str(item["source_id"]),
+                    source_ref=str(item["source_ref"]),
+                    approved_at=str(item["approved_at"]),
+                )
+                for item in _report_records(reconciliation, "approvals")
+            ),
+            findings=tuple(
+                IntegrityFinding(
+                    finding_id=str(item["finding_id"]),
+                    source_id=str(item["source_id"]),
+                    evidence_state=EvidenceState(str(item["evidence_state"])),
+                    detail=str(item["detail"]),
+                    structurally_valid=item.get("structurally_valid"),
+                    lineage_valid=item.get("lineage_valid"),
+                    lineage_required=item.get("lineage_required") is True,
+                    expected_sha256=(
+                        str(item["expected_sha256"])
+                        if item.get("expected_sha256") is not None
+                        else None
+                    ),
+                    observed_sha256=(
+                        str(item["observed_sha256"])
+                        if item.get("observed_sha256") is not None
+                        else None
+                    ),
+                )
+                for item in _report_records(reconciliation, "findings")
+            ),
+            conflicts=tuple(
+                ConflictRecord(
+                    conflict_id=str(item["conflict_id"]),
+                    field=str(item["field"]),
+                    material=item["material"] is True,
+                    claim_ids=tuple(str(value) for value in item["claim_ids"]),
+                    resolution_approval_id=(
+                        str(item["resolution_approval_id"])
+                        if item.get("resolution_approval_id") is not None
+                        else None
+                    ),
+                )
+                for item in _report_records(reconciliation, "conflicts")
+            ),
+            selected_claim_ids=tuple(
+                str(value) for value in reconciliation["selected_claim_ids"]
+            ),
+            notes=tuple(str(value) for value in reconciliation["notes"]),
+        )
+        record = PreflightRecord(
+            project_id=str(preflight["project_id"]),
+            package_id=str(preflight["package_id"]),
+            status=ReadinessStatus(str(preflight["status"])),
+            reasons=tuple(str(value) for value in preflight["reasons"]),
+            conditions=tuple(str(value) for value in preflight["conditions"]),
+            authorized_actions=tuple(
+                str(value) for value in preflight["authorized_actions"]
+            ),
+            prohibited_actions=tuple(
+                str(value) for value in preflight["prohibited_actions"]
+            ),
+            unresolved_actions=tuple(
+                str(value) for value in preflight["unresolved_actions"]
+            ),
+            exact_next_action=(
+                str(preflight["exact_next_action"])
+                if preflight.get("exact_next_action") is not None
+                else None
+            ),
+            companion_skill_or_stage=(
+                str(preflight["companion_skill_or_stage"])
+                if preflight.get("companion_skill_or_stage") is not None
+                else None
+            ),
+            evidence_references=tuple(
+                str(value) for value in preflight["evidence_references"]
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return _preflight_matches_report(record, report)
 
 
 def _render_template(template: str, values: Mapping[str, str]) -> str:
@@ -596,17 +1063,47 @@ def _render_template(template: str, values: Mapping[str, str]) -> str:
         for key, value in values.items()
     ):
         raise ValueError("template values must map token names to text")
-    tokens = set(_TEMPLATE_TOKEN.findall(template))
-    syntax_remainder = _TEMPLATE_TOKEN.sub("", template)
-    if "{{" in syntax_remainder or "}}" in syntax_remainder:
-        raise ValueError("template contains invalid token syntax")
+    tokens, spans = _scan_template_tokens(template)
     missing = sorted(tokens - set(values))
     unused = sorted(set(values) - tokens)
     if missing:
         raise ValueError("missing template tokens: " + ", ".join(missing))
     if unused:
         raise ValueError("unused template tokens: " + ", ".join(unused))
-    return _TEMPLATE_TOKEN.sub(lambda match: values[match.group(1)], template)
+    rendered: list[str] = []
+    position = 0
+    for start, end, token in spans:
+        rendered.append(template[position:start])
+        rendered.append(values[token])
+        position = end
+    rendered.append(template[position:])
+    return "".join(rendered)
+
+
+def _scan_template_tokens(
+    template: str,
+) -> tuple[set[str], list[tuple[int, int, str]]]:
+    tokens: set[str] = set()
+    spans: list[tuple[int, int, str]] = []
+    position = 0
+    while position < len(template):
+        if template.startswith("{{", position):
+            end = template.find("}}", position + 2)
+            if end < 0:
+                raise ValueError("template contains invalid token syntax")
+            content = template[position + 2 : end]
+            match = _TEMPLATE_TOKEN_CONTENT.fullmatch(content)
+            if match is None:
+                raise ValueError("template contains invalid token syntax")
+            token = match.group(1)
+            tokens.add(token)
+            spans.append((position, end + 2, token))
+            position = end + 2
+            continue
+        if template[position] in "{}":
+            raise ValueError("template contains invalid token syntax")
+        position += 1
+    return tokens, spans
 
 
 def _read_asset_text(path: Path, label: str) -> str:
@@ -632,6 +1129,7 @@ def _validate_json_artifacts(
         ("lineage/LINEAGE.json", "lineage", "lineage"),
         ("evidence/INDEX.json", "evidence", "evidence"),
         ("receipts/RECONCILIATION.json", "reconciliation", "reconciliation"),
+        ("receipts/PREFLIGHT.json", "preflight", "preflight"),
     ]
     if include_manifest:
         artifacts.append(("MANIFEST.json", "manifest", "manifest"))
@@ -639,6 +1137,140 @@ def _validate_json_artifacts(
         value = _read_json_object(root / relative, relative, violations)
         if value is not None:
             _validate_against_schema(value, schema_name, label, violations)
+
+
+def _validate_completed_documents(root: Path, violations: list[str]) -> None:
+    """Validate rendered semantics before checksums or publication are attempted."""
+
+    manifest = _read_json_object(root / "MANIFEST.json", "MANIFEST.json", violations)
+    reconciliation = _read_json_object(
+        root / "receipts/RECONCILIATION.json",
+        "receipts/RECONCILIATION.json",
+        violations,
+    )
+    preflight = _read_json_object(
+        root / "receipts/PREFLIGHT.json", "receipts/PREFLIGHT.json", violations
+    )
+    if manifest is not None and reconciliation is not None and preflight is not None:
+        _validate_document_contracts(
+            root, manifest, reconciliation, preflight, violations
+        )
+
+
+def _validate_document_contracts(
+    root: Path,
+    manifest: Mapping[str, object],
+    reconciliation: Mapping[str, object],
+    preflight: Mapping[str, object],
+    violations: list[str],
+) -> None:
+    allowed = set(_preflight_value(preflight, "authorized_actions"))
+    prohibited = set(_preflight_value(preflight, "prohibited_actions"))
+    if allowed & prohibited:
+        violations.append("document contract has contradictory action authority")
+    if preflight.get("status") == ReadinessStatus.BLOCKED.value and allowed:
+        violations.append("document contract authorizes actions while Blocked")
+
+    exact_next = _display_optional(
+        preflight.get("exact_next_action")
+        if isinstance(preflight.get("exact_next_action"), str)
+        else None
+    )
+    companion = _display_optional(
+        preflight.get("companion_skill_or_stage")
+        if isinstance(preflight.get("companion_skill_or_stage"), str)
+        else None
+    )
+    package_id = str(manifest.get("package_id"))
+    project_id = str(manifest.get("project_id"))
+    created_at = str(manifest.get("created_at"))
+    status = str(manifest.get("status"))
+    readiness = str(manifest.get("readiness"))
+    fragments: dict[str, list[str]] = {
+        "HANDOFF_README.md": [
+            f"# Continuity handoff: {package_id}",
+            "## Package identity",
+            f"- Project ID: `{project_id}`",
+            f"- Package ID: `{package_id}`",
+            f"- Created at: `{created_at}`",
+            f"- Lifecycle status: `{status}`",
+            f"- Readiness: `{readiness}`",
+            "## Safe resume",
+            "## Supplemental narrative",
+            "## Promotion",
+        ],
+        "CANONICAL_STATE.md": [
+            "# Canonical project state",
+            "| Material claim | Value | Evidence state | Source reference | Record ID |",
+            *_selected_claim_rows(reconciliation),
+            "## Supplemental narrative",
+        ],
+        "AUTHORITY_LEDGER.md": [
+            "# Authority ledger",
+            *_approval_rows(reconciliation),
+            "## Allowed actions\n\n"
+            + _markdown_list(_preflight_value(preflight, "authorized_actions")),
+            "## Prohibited actions\n\n"
+            + _markdown_list(_preflight_value(preflight, "prohibited_actions")),
+            "## Unresolved actions\n\n"
+            + _markdown_list(_preflight_value(preflight, "unresolved_actions")),
+            "## Supplemental narrative",
+        ],
+        "CONFLICT_RESOLUTIONS.md": [
+            "# Conflict resolutions",
+            *_conflict_rows(reconciliation),
+            "## Supplemental narrative",
+        ],
+        "UNRESOLVED.md": [
+            "# Unresolved project state",
+            *_unresolved_rows(reconciliation, preflight),
+            "## Unresolved records\n\n" + _unresolved_summary(reconciliation, preflight),
+            "## Supplemental narrative",
+        ],
+        "NEXT_THREAD_PROMPT.txt": [
+            f"Project ID: `{project_id}`",
+            f"Package ID: `{package_id}`",
+            f"Readiness: `{readiness}`",
+            f"Exact next action: `{exact_next}`",
+            "Supplemental narrative:",
+        ],
+        "SUPERPOWERS_PREFLIGHT.md": [
+            "# Continuity readiness preflight",
+            "Schema: `continuity.preflight/v1`",
+            f"Project ID: `{project_id}`",
+            f"Package ID: `{package_id}`",
+            f"Readiness: `{readiness}`",
+            f"Exact next action: `{exact_next}`",
+            f"Companion skill or stage: `{companion}`",
+            "## Reasons\n\n" + _markdown_list(_preflight_value(preflight, "reasons")),
+            "## Conditions\n\n"
+            + _markdown_list(_preflight_value(preflight, "conditions")),
+            "## Authorized actions\n\n"
+            + _markdown_list(_preflight_value(preflight, "authorized_actions")),
+            "## Prohibited actions\n\n"
+            + _markdown_list(_preflight_value(preflight, "prohibited_actions")),
+            "## Unresolved actions\n\n"
+            + _markdown_list(_preflight_value(preflight, "unresolved_actions")),
+            "## Evidence references\n\n"
+            + _markdown_list(_preflight_value(preflight, "evidence_references")),
+            "## Supplemental narrative",
+        ],
+    }
+    for document, expected_fragments in fragments.items():
+        path = root / document
+        if not _is_regular_file(path):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            violations.append(f"document contract is unreadable: {document}")
+            continue
+        for fragment in expected_fragments:
+            if text.count(fragment) != 1:
+                violations.append(
+                    f"document contract is missing or duplicates a governing record: {document}"
+                )
+                break
 
 
 def _validate_against_schema(
@@ -659,6 +1291,16 @@ def _validate_against_schema(
     schema_violations: list[str] = []
     _validate_schema_node(instance, schema_value, schema_value, "$", schema_violations)
     violations.extend(f"{label} schema violation: {item}" for item in schema_violations)
+
+
+def validate_preflight_record(record: PreflightRecord) -> tuple[str, ...]:
+    """Validate the exact portable preflight object against its bundled schema."""
+
+    if not isinstance(record, PreflightRecord):
+        return ("preflight record must be a PreflightRecord",)
+    violations: list[str] = []
+    _validate_against_schema(record.to_dict(), "preflight", "preflight", violations)
+    return tuple(violations)
 
 
 def _validate_schema_node(
@@ -764,6 +1406,9 @@ def _validate_schema_node(
         minimum_items = schema.get("minItems")
         if isinstance(minimum_items, int) and len(instance) < minimum_items:
             violations.append(f"{path} has too few items")
+        maximum_items = schema.get("maxItems")
+        if isinstance(maximum_items, int) and len(instance) > maximum_items:
+            violations.append(f"{path} has too many items")
         if schema.get("uniqueItems") is True:
             serialized = [
                 json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1161,6 +1806,32 @@ def _update_successor_handoff(
         text = text.replace(existing, replacement, 1)
     path.unlink()
     _write_bytes_new(path, text.encode("utf-8"))
+
+
+def _update_successor_preflight(
+    receipt_path: Path,
+    preflight_document: Path,
+    prompt_document: Path,
+    *,
+    candidate_id: str,
+    successor_id: str,
+) -> None:
+    preflight = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(preflight, dict) or preflight.get("package_id") != candidate_id:
+        raise ValueError("candidate preflight identity does not match its manifest")
+    preflight["package_id"] = successor_id
+    receipt_path.unlink()
+    _write_json_new(receipt_path, preflight)
+    for path in (preflight_document, prompt_document):
+        text = path.read_text(encoding="utf-8")
+        existing = f"Package ID: `{candidate_id}`"
+        if text.count(existing) != 1:
+            raise ValueError("candidate document identity does not match its manifest")
+        path.unlink()
+        _write_bytes_new(
+            path,
+            text.replace(existing, f"Package ID: `{successor_id}`", 1).encode("utf-8"),
+        )
 
 
 def _package_sha256(root: Path) -> str:

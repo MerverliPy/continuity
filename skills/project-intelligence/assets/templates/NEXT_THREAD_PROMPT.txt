@@ -1,5 +1,11 @@
 Resume only the selected Continuity project represented by this portable package. Verify SHA256SUMS.txt and MANIFEST.json, inspect AUTHORITY_LEDGER.md and UNRESOLVED.md, preserve all source evidence as read-only, and obey the recorded lifecycle/readiness gates.
 
-{{ next_thread_prompt }}
+Project ID: `{{ project_id }}`
+Package ID: `{{ package_id }}`
+Readiness: `{{ readiness }}`
+Exact next action: `{{ exact_next_action }}`
+
+Supplemental narrative:
+{{ supplemental_narrative }}
 
 Do not call a Candidate canonical. Do not route a Blocked package to planning, implementation, testing, review, deployment, or other execution.

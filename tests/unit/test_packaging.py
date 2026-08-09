@@ -12,6 +12,7 @@ from continuity.models import (
     ConflictRecord,
     EvidenceState,
     PackageStatus,
+    PreflightRecord,
     ReadinessStatus,
 )
 from continuity.packaging import (
@@ -24,6 +25,7 @@ from continuity.packaging import (
     validate_package,
 )
 from continuity.reconciliation import IntegrityFinding, ReconciliationReport
+from continuity.readiness import classify_readiness
 
 
 DOCUMENT_PATHS = (
@@ -46,6 +48,31 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
         "source-tree",
         "source/project.json",
         EvidenceState.VERIFIED,
+    )
+    lifecycle = ClaimRecord(
+        "lifecycle-alpha",
+        "package status",
+        "Canonical",
+        "source-tree",
+        "source/project.json",
+        EvidenceState.VERIFIED,
+    )
+    action = ClaimRecord(
+        "action-implementation",
+        "authorized action",
+        "implementation",
+        "source-tree",
+        "source/authority.json",
+        EvidenceState.VERIFIED,
+    )
+    implementation_approval = ApprovalRecord(
+        "approval-implementation",
+        "authorize-actions",
+        ("implementation",),
+        "approved",
+        "user",
+        "conversation://approval/implementation",
+        "2026-08-09T11:00:00Z",
     )
     conflict = (
         ConflictRecord(
@@ -75,8 +102,8 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
         ),
     ) if blocked else ()
     return ReconciliationReport(
-        claims=(project, *competing_claims),
-        approvals=(),
+        claims=(project, lifecycle, action, *competing_claims),
+        approvals=(implementation_approval,),
         findings=(
             IntegrityFinding(
                 "integrity-source",
@@ -87,7 +114,7 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
             ),
         ),
         conflicts=conflict,
-        selected_claim_ids=(project.claim_id,),
+        selected_claim_ids=(project.claim_id, lifecycle.claim_id, action.claim_id),
         notes=(),
     )
 
@@ -112,10 +139,10 @@ def _resolved_report() -> ReconciliationReport:
     )
     return ReconciliationReport(
         claims=blocked.claims,
-        approvals=(approval,),
+        approvals=(*blocked.approvals, approval),
         findings=blocked.findings,
         conflicts=(conflict,),
-        selected_claim_ids=("project-alpha", "claim-monolith"),
+        selected_claim_ids=(*blocked.selected_claim_ids, "claim-monolith"),
         notes=(),
     )
 
@@ -138,6 +165,33 @@ def _request(
     if not source_zip.exists():
         with zipfile.ZipFile(source_zip, "w") as archive:
             archive.writestr("proof.txt", "immutable evidence\n")
+    selected_report = report or _report()
+    if readiness is ReadinessStatus.CONDITIONAL and report is None:
+        condition = ClaimRecord(
+            "condition-platform",
+            "condition",
+            {
+                "condition": "deployment platform is not selected",
+                "does_not_affect_action": True,
+                "basis": "implementation is platform-neutral",
+            },
+            "source-tree",
+            "source/conditions.json",
+            EvidenceState.UNRESOLVED,
+        )
+        selected_report = ReconciliationReport(
+            claims=(*selected_report.claims, condition),
+            approvals=selected_report.approvals,
+            findings=selected_report.findings,
+            conflicts=selected_report.conflicts,
+            selected_claim_ids=selected_report.selected_claim_ids,
+            notes=selected_report.notes,
+        )
+    preflight = PreflightRecord.from_decision(
+        classify_readiness(selected_report, "implementation"),
+        "alpha",
+        package_id,
+    )
     return CandidateBuildRequest(
         package_id=package_id,
         project_id="alpha",
@@ -146,9 +200,13 @@ def _request(
             "source-tree": _tree_hash(source_root),
             "input-zip": sha256_file(source_zip),
         },
-        approved_reconciliation_report=report or _report(),
+        approved_reconciliation_report=selected_report,
         canonical_files=canonical_files or {"src/app.py": source_file},
-        rendered_documents={path: f"# {path}\n\nApproved state.\n" for path in DOCUMENT_PATHS},
+        rendered_documents={
+            path: "Supplemental narrative only; structured records govern.\n"
+            for path in DOCUMENT_PATHS
+        },
+        preflight_decision=preflight,
         lineage_data={
             "schema": "continuity.lineage/v1",
             "package_id": package_id,
@@ -247,19 +305,92 @@ def test_template_renderer_rejects_missing_and_unused_tokens() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "template",
+    (
+        "{{{ package_id }}}",
+        "{{ package_id }}}",
+        "{{{ package_id }}",
+        "{{ package_id }",
+        "package_id }}",
+        "{{ outer {{ inner }} }}",
+    ),
+)
+def test_template_renderer_rejects_malformed_or_overlapping_braces(
+    template: str,
+) -> None:
+    """Catches malformed brace sequences being accepted as literal document text."""
+    with pytest.raises(ValueError, match="invalid token syntax"):
+        _render_template(
+            template,
+            {"package_id": "candidate-alpha", "outer": "value", "inner": "value"},
+        )
+
+
 def test_candidate_documents_are_rendered_from_bundled_templates(tmp_path: Path) -> None:
     """Catches package construction bypassing the reviewed v1 document structure."""
-    result = build_candidate(_request(tmp_path))
+    request = _request(tmp_path, report=_resolved_report())
+    result = build_candidate(request)
     handoff = (result.root / "HANDOFF_README.md").read_text(encoding="utf-8")
     canonical_state = (result.root / "CANONICAL_STATE.md").read_text(encoding="utf-8")
+    authority = (result.root / "AUTHORITY_LEDGER.md").read_text(encoding="utf-8")
+    conflicts = (result.root / "CONFLICT_RESOLUTIONS.md").read_text(encoding="utf-8")
+    preflight = (result.root / "SUPERPOWERS_PREFLIGHT.md").read_text(encoding="utf-8")
 
     assert "# Continuity handoff: candidate-alpha" in handoff
     assert "Candidate is not Canonical" in handoff
-    assert "# HANDOFF_README.md" in handoff
+    assert "Supplemental narrative only" in handoff
     assert "| Material claim | Value | Evidence state | Source reference | Record ID |" in (
         canonical_state
     )
-    assert "# CANONICAL_STATE.md" in canonical_state
+    for claim_id in request.approved_reconciliation_report.selected_claim_ids:
+        assert canonical_state.count(claim_id) == 1
+    for approval in request.approved_reconciliation_report.approvals:
+        assert authority.count(approval.approval_id) == 1
+    for conflict in request.approved_reconciliation_report.conflicts:
+        assert conflicts.count(conflict.conflict_id) == 1
+        assert conflicts.count(conflict.resolution_approval_id or "Unresolved") >= 1
+    assert "Readiness: `Ready`" in preflight
+    assert "Exact next action: `implementation`" in preflight
+    assert "Companion skill or stage: `superpowers:test-driven-development`" in preflight
+    assert json.loads(
+        (result.root / "receipts/PREFLIGHT.json").read_text(encoding="utf-8")
+    ) == request.preflight_decision.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("document", "governing_fragment"),
+    (
+        ("HANDOFF_README.md", "- Package ID: `candidate-alpha`"),
+        ("CANONICAL_STATE.md", "claim-monolith"),
+        ("AUTHORITY_LEDGER.md", "approval-architecture"),
+        ("CONFLICT_RESOLUTIONS.md", "conflict-architecture"),
+        ("UNRESOLVED.md", "## Unresolved records"),
+        ("NEXT_THREAD_PROMPT.txt", "Exact next action: `implementation`"),
+        (
+            "SUPERPOWERS_PREFLIGHT.md",
+            "Companion skill or stage: `superpowers:test-driven-development`",
+        ),
+    ),
+)
+def test_document_contract_tampering_is_rejected_after_integrity_regeneration(
+    tmp_path: Path, document: str, governing_fragment: str
+) -> None:
+    """Catches checksum-valid prose omitting a required structured record."""
+    result = build_candidate(_request(tmp_path, report=_resolved_report()))
+    document_path = result.root / document
+    text = document_path.read_text(encoding="utf-8")
+    assert governing_fragment in text
+    document_path.write_text(
+        text.replace(governing_fragment, "CORRUPTED-GOVERNING-RECORD", 1),
+        encoding="utf-8",
+    )
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("document contract" in item for item in validation.violations)
 
 
 def test_nested_schema_extension_is_rejected_before_publication(tmp_path: Path) -> None:
@@ -316,6 +447,7 @@ def test_candidate_contract_is_complete_and_sources_are_unchanged(tmp_path: Path
         "evidence/INDEX.json",
         "lineage/LINEAGE.json",
         "receipts/RECONCILIATION.json",
+        "receipts/PREFLIGHT.json",
         "MANIFEST.json",
         "SHA256SUMS.txt",
     }
@@ -474,7 +606,10 @@ def test_validation_binds_selected_project_claim_to_manifest_identity(tmp_path: 
     result = build_candidate(_request(tmp_path))
     receipt_path = result.root / "receipts/RECONCILIATION.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt["claims"][0]["value"] = "beta"
+    project_claim = next(
+        claim for claim in receipt["claims"] if claim["field"] == "project id"
+    )
+    project_claim["value"] = "beta"
     receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
     _regenerate_integrity(result.root)
 
@@ -492,12 +627,15 @@ def test_validation_requires_exactly_one_selected_project_claim(
     result = build_candidate(_request(tmp_path))
     receipt_path = result.root / "receipts/RECONCILIATION.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    project_claim = next(
+        claim for claim in receipt["claims"] if claim["field"] == "project id"
+    )
     if case == "absent":
-        receipt["claims"][0]["field"] = "goal"
+        project_claim["field"] = "goal"
     elif case == "unselected":
         receipt["selected_claim_ids"] = []
     else:
-        duplicate = {**receipt["claims"][0], "claim_id": "project-alpha-second"}
+        duplicate = {**project_claim, "claim_id": "project-alpha-second"}
         receipt["claims"].append(duplicate)
         receipt["selected_claim_ids"].append(duplicate["claim_id"])
     receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
@@ -528,7 +666,12 @@ def test_resolved_conflict_selects_exactly_the_approved_disputed_claim(
     result = build_candidate(_request(tmp_path, report=_resolved_report()))
     receipt_path = result.root / "receipts/RECONCILIATION.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt["selected_claim_ids"] = ["project-alpha", *disputed_selection]
+    receipt["selected_claim_ids"] = [
+        "project-alpha",
+        "lifecycle-alpha",
+        "action-implementation",
+        *disputed_selection,
+    ]
     receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
     _regenerate_integrity(result.root)
 
@@ -999,7 +1142,16 @@ def test_promotion_is_append_only_and_regenerates_integrity_artifacts(tmp_path: 
     assert receipt["approval"]["approval_id"] == "approval-promote-alpha"
     successor_manifest = json.loads((canonical.root / "MANIFEST.json").read_text())
     successor_lineage = json.loads((canonical.root / "lineage/LINEAGE.json").read_text())
+    successor_preflight = json.loads(
+        (canonical.root / "receipts/PREFLIGHT.json").read_text(encoding="utf-8")
+    )
     successor_handoff = (canonical.root / "HANDOFF_README.md").read_text(encoding="utf-8")
+    successor_preflight_document = (
+        canonical.root / "SUPERPOWERS_PREFLIGHT.md"
+    ).read_text(encoding="utf-8")
+    successor_prompt = (canonical.root / "NEXT_THREAD_PROMPT.txt").read_text(
+        encoding="utf-8"
+    )
     assert successor_manifest["created_at"] == "2026-08-09T14:00:00Z"
     assert successor_lineage["created_at"] == "2026-08-09T14:00:00Z"
     assert successor_manifest["successor_created_at"] == "2026-08-09T14:00:00Z"
@@ -1009,6 +1161,11 @@ def test_promotion_is_append_only_and_regenerates_integrity_artifacts(tmp_path: 
     assert "- Created at: `2026-08-09T14:00:00Z`" in successor_handoff
     assert "- Lifecycle status: `Canonical`" in successor_handoff
     assert "Candidate predecessor was not Canonical" in successor_handoff
+    assert successor_preflight["package_id"] == "canonical-alpha"
+    assert "Package ID: `canonical-alpha`" in successor_preflight_document
+    assert "Package ID: `canonical-alpha`" in successor_prompt
+    assert "Package ID: `candidate-alpha`" not in successor_preflight_document
+    assert "Package ID: `candidate-alpha`" not in successor_prompt
     assert _package_snapshot(candidate.root) == candidate_before
     assert candidate.zip_path.read_bytes() == candidate_zip_before
     assert canonical.zip_path.read_bytes() != candidate.zip_path.read_bytes()

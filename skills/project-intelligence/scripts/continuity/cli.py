@@ -21,12 +21,14 @@ from .models import (
     ConflictRecord,
     EvidenceState,
     PackageStatus,
+    PreflightRecord,
     ReadinessStatus,
 )
 from .packaging import (
     CandidateBuildRequest,
     build_candidate,
     promote_candidate,
+    validate_preflight_record,
     validate_package,
 )
 from .readiness import classify_readiness
@@ -75,11 +77,28 @@ _BUILD_FIELDS = frozenset(
         "reconciliation_report",
         "canonical_files",
         "rendered_documents",
+        "preflight_decision",
         "lineage_data",
         "evidence_index",
         "secure_handling_approvals",
         "readiness",
         "allow_conditional_promotion",
+    }
+)
+_PREFLIGHT_FIELDS = frozenset(
+    {
+        "schema",
+        "project_id",
+        "package_id",
+        "status",
+        "reasons",
+        "conditions",
+        "authorized_actions",
+        "prohibited_actions",
+        "unresolved_actions",
+        "exact_next_action",
+        "companion_skill_or_stage",
+        "evidence_references",
     }
 )
 
@@ -135,6 +154,8 @@ def _parser() -> argparse.ArgumentParser:
 
     preflight_command = commands.add_parser("preflight")
     preflight_command.add_argument("--reconciliation", required=True)
+    preflight_command.add_argument("--project-id", required=True)
+    preflight_command.add_argument("--package-id", required=True)
     preflight_command.add_argument("--requested-action", required=True)
     preflight_command.add_argument("--output", dest="json_output", required=True)
     preflight_command.set_defaults(handler=_preflight_command)
@@ -350,6 +371,9 @@ def _build_command(namespace: argparse.Namespace) -> _CommandResult:
         ),
         canonical_files={path: Path(source) for path, source in canonical_files.items()},
         rendered_documents=documents,
+        preflight_decision=_parse_preflight_record(
+            _mapping(value.get("preflight_decision"), "preflight_decision")
+        ),
         lineage_data=lineage,
         evidence_index=evidence,
         secure_handling_approvals=approvals,
@@ -477,20 +501,18 @@ def _preflight_command(namespace: argparse.Namespace) -> _CommandResult:
     decision = classify_readiness(
         report, _required_text(namespace.requested_action, "requested_action")
     )
-    payload = {
-        "ok": True,
-        "operation": "preflight",
-        "decision": {
-            "authorized_actions": list(decision.authorized_actions),
-            "conditions": list(decision.conditions),
-            "exact_next_action": decision.exact_next_action,
-            "prohibited_actions": list(decision.prohibited_actions),
-            "reasons": list(decision.reasons),
-            "recommended_superpowers_skill": decision.recommended_superpowers_skill,
-            "status": decision.status.value,
-        },
-    }
-    return _CommandResult(payload, 2 if decision.status is ReadinessStatus.BLOCKED else 0)
+    record = PreflightRecord.from_decision(
+        decision,
+        _required_text(namespace.project_id, "project_id"),
+        _required_text(namespace.package_id, "package_id"),
+    )
+    violations = validate_preflight_record(record)
+    if violations:
+        raise ValueError("generated preflight is invalid: " + "; ".join(violations))
+    return _CommandResult(
+        record.to_dict(),
+        2 if decision.status is ReadinessStatus.BLOCKED else 0,
+    )
 
 
 def _parse_report(value: Mapping[str, object]) -> ReconciliationReport:
@@ -514,6 +536,42 @@ def _parse_report(value: Mapping[str, object]) -> ReconciliationReport:
     if tuple(sorted(supplied_blocking)) != actual_blocking:
         raise CliInputError("reconciliation report blocking conflicts are inconsistent")
     return report
+
+
+def _parse_preflight_record(value: Mapping[str, object]) -> PreflightRecord:
+    _exact_fields(value, _PREFLIGHT_FIELDS, "preflight_decision")
+    if value.get("schema") != "continuity.preflight/v1":
+        raise CliInputError("preflight_decision schema is unsupported")
+    record = PreflightRecord(
+        project_id=_required_text(value.get("project_id"), "preflight project_id"),
+        package_id=_required_text(value.get("package_id"), "preflight package_id"),
+        status=_enum(ReadinessStatus, value.get("status"), "preflight status"),
+        reasons=_string_tuple(value.get("reasons"), "preflight reasons"),
+        conditions=_string_tuple(value.get("conditions"), "preflight conditions"),
+        authorized_actions=_string_tuple(
+            value.get("authorized_actions"), "preflight authorized_actions"
+        ),
+        prohibited_actions=_string_tuple(
+            value.get("prohibited_actions"), "preflight prohibited_actions"
+        ),
+        unresolved_actions=_string_tuple(
+            value.get("unresolved_actions"), "preflight unresolved_actions"
+        ),
+        exact_next_action=_optional_text(
+            value.get("exact_next_action"), "preflight exact_next_action"
+        ),
+        companion_skill_or_stage=_optional_text(
+            value.get("companion_skill_or_stage"),
+            "preflight companion_skill_or_stage",
+        ),
+        evidence_references=_string_tuple(
+            value.get("evidence_references"), "preflight evidence_references"
+        ),
+    )
+    violations = validate_preflight_record(record)
+    if violations:
+        raise CliInputError(violations[0])
+    return record
 
 
 def _parse_claim(value: Mapping[str, object]) -> ClaimRecord:

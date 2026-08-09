@@ -198,6 +198,8 @@ def test_blocked_preflight_cannot_name_an_execution_stage(repo_root: Path) -> No
     document = {
         **_documents()["preflight"],
         "status": "Blocked",
+        "authorized_actions": [],
+        "unresolved_actions": ["resolve readiness blockers"],
         "exact_next_action": None,
     }
 
@@ -205,6 +207,39 @@ def test_blocked_preflight_cannot_name_an_execution_stage(repo_root: Path) -> No
 
     document["companion_skill_or_stage"] = None
     assert list(validator.iter_errors(document)) == []
+
+
+def test_blocked_preflight_rejects_authorized_execution(repo_root: Path) -> None:
+    """Catches an execution action remaining authorized behind a Blocked label."""
+    validator = Draft202012Validator(_schema(repo_root, "preflight"))
+    document = {
+        **_documents()["preflight"],
+        "status": "Blocked",
+        "exact_next_action": None,
+        "companion_skill_or_stage": None,
+        "unresolved_actions": ["resolve readiness blockers"],
+    }
+
+    assert list(validator.iter_errors(document))
+
+
+@pytest.mark.parametrize("status", ("Ready", "Conditional"))
+def test_actionable_preflight_requires_authorized_and_exact_action(
+    repo_root: Path, status: str
+) -> None:
+    """Catches actionable readiness without an explicit authorization boundary."""
+    validator = Draft202012Validator(_schema(repo_root, "preflight"))
+    document = {
+        **_documents()["preflight"],
+        "status": status,
+        "authorized_actions": [],
+    }
+
+    assert list(validator.iter_errors(document))
+
+    document["authorized_actions"] = ["implementation"]
+    document["exact_next_action"] = None
+    assert list(validator.iter_errors(document))
 
 
 def test_identity_lifecycle_authority_and_readiness_objects_are_closed(

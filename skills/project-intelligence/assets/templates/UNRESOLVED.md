@@ -6,4 +6,12 @@ Every material unknown must retain an Evidence state, Source reference or inspec
 | --- | --- | --- | --- | --- |
 {{ unresolved_records }}
 
+## Unresolved records
+
+{{ unresolved_summary }}
+
+## Supplemental narrative
+
+{{ supplemental_narrative }}
+
 `Unresolved`, `Contradicted`, and `Missing` are distinct states and must not be rewritten as verified conclusions.

@@ -4,6 +4,10 @@ Every material claim must occupy a row with its Evidence state, inspected Source
 
 | Material claim | Value | Evidence state | Source reference | Record ID |
 | --- | --- | --- | --- | --- |
-{{ canonical_state }}
+{{ selected_claim_records }}
+
+## Supplemental narrative
+
+{{ supplemental_narrative }}
 
 The package lifecycle status in `MANIFEST.json` controls whether this recorded state is a Candidate or Canonical authority root.

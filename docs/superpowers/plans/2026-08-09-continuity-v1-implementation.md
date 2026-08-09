@@ -165,8 +165,24 @@ class PreflightDecision:
     conditions: tuple[str, ...]
     authorized_actions: tuple[str, ...]
     prohibited_actions: tuple[str, ...]
+    unresolved_actions: tuple[str, ...]
     exact_next_action: str | None
-    recommended_superpowers_skill: str | None
+    companion_skill_or_stage: str | None
+    evidence_references: tuple[str, ...]
+
+@dataclass(frozen=True)
+class PreflightRecord:
+    project_id: str
+    package_id: str
+    status: ReadinessStatus
+    reasons: tuple[str, ...]
+    conditions: tuple[str, ...]
+    authorized_actions: tuple[str, ...]
+    prohibited_actions: tuple[str, ...]
+    unresolved_actions: tuple[str, ...]
+    exact_next_action: str | None
+    companion_skill_or_stage: str | None
+    evidence_references: tuple[str, ...]
 ```
 
 ```python
@@ -557,7 +573,7 @@ Use parameterized cases for:
 | Multiple selected projects | `Blocked` |
 | Candidate not explicitly promoted | `Blocked` for implementation |
 
-Assert every decision has sorted reasons, explicit authorized/prohibited actions, and one exact next action or `None`. A blocked decision must have `recommended_superpowers_skill is None` unless the recommendation is a non-execution clarification stage.
+Assert every decision has sorted reasons, explicit authorized/prohibited/unresolved actions, cited evidence references, and one exact next action or `None`. A blocked decision must have no authorized actions, no exact next action, and `companion_skill_or_stage is None`.
 
 - [ ] **Step 2: Write failing redaction tests.**
 
@@ -644,7 +660,7 @@ Expected: import failure for `continuity.packaging`.
 
 - [ ] **Step 3: Implement candidate construction.**
 
-`CandidateBuildRequest` must contain package ID, project ID, explicit `created_at`, selected source hashes, approved reconciliation report, canonical file mappings, rendered document contents, lineage data, evidence index, and secure-handling approvals.
+`CandidateBuildRequest` must contain package ID, project ID, explicit `created_at`, selected source hashes, approved reconciliation report, canonical file mappings, a required identity-bound `preflight_decision: PreflightRecord`, supplemental document narrative, lineage data, evidence index, and secure-handling approvals. Supplemental narrative cannot satisfy or override structured claims, approvals, conflicts, unresolved records, or readiness fields.
 
 Build in a tool-owned temporary outer release directory. Copy files into `package/` by streaming bytes without following symlinks. Render supplied structured content through fixed templates in Task 8; until those files exist, tests may supply template text directly through the request. Validate, generate the manifest and checksums, and write `<package_id>.zip` beside `package/`. Atomically rename the single outer release directory to its final path using no-clobber publication semantics. The ZIP contains the contents of `package/` at its archive root; the outer release directory is transport structure and is not inventoried.
 
@@ -729,7 +745,7 @@ Do not expose local absolute paths or secret values in error messages. The wrapp
 
 - [ ] **Step 4: Implement all CLI verbs and gate exit codes.**
 
-Use `argparse` subcommands. Write output via a temporary sibling file followed by `os.replace`. `inspect` accepts a directory or ZIP. `validate` accepts an unpacked package or ZIP but must use safe extraction for ZIPs. `preflight` returns exit `2` for `Blocked` and `0` for `Ready` or `Conditional`.
+Use `argparse` subcommands. Write output via a temporary sibling file followed by `os.replace`. `inspect` accepts a directory or ZIP. `validate` accepts an unpacked package or ZIP but must use safe extraction for ZIPs. `preflight` returns the exact schema-validated `continuity.preflight/v1` object with `schema`, project/package identity, status, reasons, conditions, authorized/prohibited/unresolved actions, exact next action, `companion_skill_or_stage`, and evidence references. It returns exit `2` for `Blocked` and `0` for `Ready` or `Conditional`.
 
 - [ ] **Step 5: Run integration and full tests.**
 
@@ -819,7 +835,7 @@ The skills must instruct the agent to:
 
 - [ ] **Step 6: Connect package rendering to the bundled templates and validate schemas.**
 
-Package construction must load assets relative to `packaging.py`, render strictly, validate JSON artifacts before checksums, then validate the completed package independently.
+Package construction must load assets relative to `packaging.py`, reject malformed, unbalanced, nested, unknown, missing, or unused template tokens, and render governing sections from the approved reconciliation report and exact `PreflightRecord`. User document text is supplemental narrative only. Before checksums and publication, validate every completed document for its required headings and one entry per governing record; independent package validation repeats those semantic checks and rejects stale lifecycle identity or contradictory authority.
 
 - [ ] **Step 7: Run contract, unit, integration, and full tests.**
 

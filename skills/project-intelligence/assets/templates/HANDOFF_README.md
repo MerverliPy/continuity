@@ -15,7 +15,9 @@
 
 Verify `SHA256SUMS.txt`, validate `MANIFEST.json`, and inspect the authority ledger before relying on any package claim. The outer release directory is transport structure; the portable package is the `package/` directory or its sibling ZIP.
 
-{{ handoff_body }}
+## Supplemental narrative
+
+{{ supplemental_narrative }}
 
 ## Promotion
 

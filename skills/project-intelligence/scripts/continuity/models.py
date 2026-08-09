@@ -79,8 +79,64 @@ class PreflightDecision:
     conditions: tuple[str, ...]
     authorized_actions: tuple[str, ...]
     prohibited_actions: tuple[str, ...]
+    unresolved_actions: tuple[str, ...]
     exact_next_action: str | None
-    recommended_superpowers_skill: str | None
+    companion_skill_or_stage: str | None
+    evidence_references: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreflightRecord:
+    """Portable identity-bound representation of one readiness decision."""
+
+    project_id: str
+    package_id: str
+    status: ReadinessStatus
+    reasons: tuple[str, ...]
+    conditions: tuple[str, ...]
+    authorized_actions: tuple[str, ...]
+    prohibited_actions: tuple[str, ...]
+    unresolved_actions: tuple[str, ...]
+    exact_next_action: str | None
+    companion_skill_or_stage: str | None
+    evidence_references: tuple[str, ...]
+
+    @classmethod
+    def from_decision(
+        cls,
+        decision: PreflightDecision,
+        project_id: str,
+        package_id: str,
+    ) -> "PreflightRecord":
+        return cls(
+            project_id=project_id,
+            package_id=package_id,
+            status=decision.status,
+            reasons=decision.reasons,
+            conditions=decision.conditions,
+            authorized_actions=decision.authorized_actions,
+            prohibited_actions=decision.prohibited_actions,
+            unresolved_actions=decision.unresolved_actions,
+            exact_next_action=decision.exact_next_action,
+            companion_skill_or_stage=decision.companion_skill_or_stage,
+            evidence_references=decision.evidence_references,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": "continuity.preflight/v1",
+            "project_id": self.project_id,
+            "package_id": self.package_id,
+            "status": self.status.value,
+            "reasons": list(self.reasons),
+            "conditions": list(self.conditions),
+            "authorized_actions": list(self.authorized_actions),
+            "prohibited_actions": list(self.prohibited_actions),
+            "unresolved_actions": list(self.unresolved_actions),
+            "exact_next_action": self.exact_next_action,
+            "companion_skill_or_stage": self.companion_skill_or_stage,
+            "evidence_references": list(self.evidence_references),
+        }
 
 
 @dataclass(frozen=True)
