@@ -35,8 +35,8 @@ _BEARER_RE = re.compile(
 )
 _CREDENTIAL_NAME = (
     r"(?:[A-Za-z][A-Za-z0-9]*[_-])*"
-    r"(?:api[_-]?key|secret[_-]?key|client[_-]?secret|access[_-]?token|"
-    r"refresh[_-]?token|password|passwd|pwd)"
+    r"(?:api[ _-]?key|secret[ _-]?key|client[ _-]?secret|access[ _-]?token|"
+    r"refresh[ _-]?token|password|passwd|pwd)"
 )
 _ASSIGNMENT_RE = re.compile(
     rf"(?im)(?P<label>(?<![\w-])"

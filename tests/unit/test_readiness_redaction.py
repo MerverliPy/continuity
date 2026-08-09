@@ -460,6 +460,42 @@ def test_namespaced_and_quoted_secret_assignments_are_fully_redacted() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        (
+            "api key = spaced-api-secret-value",
+            "api key = [REDACTED]",
+        ),
+        (
+            "client secret: spaced-client-secret-value",
+            "client secret: [REDACTED]",
+        ),
+        (
+            "access token = spaced-access-token-value",
+            "access token = [REDACTED]",
+        ),
+        (
+            "refresh token: spaced-refresh-token-value",
+            "refresh token: [REDACTED]",
+        ),
+    ),
+)
+def test_spaced_credential_labels_redact_and_exclude_source(
+    source: str, expected: str
+) -> None:
+    """Catches normalized space separators bypassing redaction and package exclusion."""
+
+    result = redact_text(source)
+    allowed_canonical_paths = exclude_secret_bearing_files(
+        {"config/spaced-credential.env": source}, ()
+    )
+
+    assert result.text == expected
+    assert len(result.findings) == 1
+    assert allowed_canonical_paths == ()
+
+
 def test_secret_bearing_files_require_exact_secure_handling_approval() -> None:
     """Catches secret files entering a candidate through broad or unrelated approval."""
     sources = {
