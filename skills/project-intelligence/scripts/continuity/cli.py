@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 from dataclasses import dataclass
 import hashlib
 import json
@@ -923,10 +924,8 @@ def _emit_stdout(payload: Mapping[str, object]) -> None:
 def _emit_best_effort(payload: Mapping[str, object], output: Path | None) -> None:
     rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     if output is not None:
-        try:
+        with suppress(CliInputError, OSError):
             _atomic_write(output, rendered)
-        except (CliInputError, OSError):
-            pass
     sys.stdout.write(rendered)
 
 
@@ -944,10 +943,8 @@ def _atomic_write(output: Path, rendered: str) -> None:
             os.fsync(target.fileno())
         os.replace(temporary, output)
     finally:
-        try:
+        with suppress(FileNotFoundError):
             temporary.unlink()
-        except FileNotFoundError:
-            pass
 
 
 if __name__ == "__main__":
