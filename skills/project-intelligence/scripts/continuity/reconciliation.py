@@ -31,7 +31,8 @@ class IntegrityFinding:
     evidence_state: EvidenceState
     detail: str = ""
     structurally_valid: bool | None = None
-    lineage_valid: bool = True
+    lineage_valid: bool | None = None
+    lineage_required: bool = False
     expected_sha256: str | None = None
     observed_sha256: str | None = None
 
@@ -42,11 +43,10 @@ class IntegrityFinding:
             if self.structurally_valid is None
             else self.structurally_valid
         )
-        return (
-            structural_gate
-            and self.lineage_valid
-            and self.evidence_state is EvidenceState.VERIFIED
+        lineage_gate = self.lineage_valid is not False and (
+            not self.lineage_required or self.lineage_valid is True
         )
+        return structural_gate and lineage_gate and self.evidence_state is EvidenceState.VERIFIED
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -56,6 +56,7 @@ class IntegrityFinding:
             "detail": self.detail,
             "structurally_valid": self.structurally_valid,
             "lineage_valid": self.lineage_valid,
+            "lineage_required": self.lineage_required,
             "expected_sha256": self.expected_sha256,
             "observed_sha256": self.observed_sha256,
         }
@@ -130,7 +131,9 @@ def reconcile_sources(
             source_findings.setdefault(finding.source_id, []).append(finding)
 
     def relevant_findings(source_id: str) -> Sequence[IntegrityFinding]:
-        return source_findings.get(source_id, wildcard_findings)
+        if source_id == "*":
+            return tuple(wildcard_findings)
+        return (*wildcard_findings, *source_findings.get(source_id, ()))
 
     def source_permits_selection(source_id: str, *, allow_uninspected: bool = False) -> bool:
         relevant = relevant_findings(source_id)
@@ -159,7 +162,7 @@ def reconcile_sources(
                 synthesized_sources.add(claim.source_id)
             continue
 
-        # Gate 2 is represented by lineage_valid on the inspected source finding.
+        # Gate 2 requires affirmative proof whenever a finding marks lineage required.
         if claim.evidence_state in {EvidenceState.VERIFIED, EvidenceState.ASSERTED} and all(
             finding.permits_automatic_selection for finding in relevant
         ):

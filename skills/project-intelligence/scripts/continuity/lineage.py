@@ -83,6 +83,7 @@ def build_lineage(sources: Sequence[SourcePackage]) -> LineageGraph:
     findings: list[LineageFinding] = []
     by_id: dict[str, SourcePackage] = {}
     hashes_by_id: dict[str, set[str]] = defaultdict(set)
+    declarations_by_identity: dict[tuple[str, str], list[SourcePackage]] = defaultdict(list)
 
     if not sources:
         findings.append(
@@ -90,7 +91,9 @@ def build_lineage(sources: Sequence[SourcePackage]) -> LineageGraph:
         )
 
     for source in sources:
-        hashes_by_id[source.package_id].add(source.root_sha256.casefold())
+        normalized_hash = source.root_sha256.casefold()
+        hashes_by_id[source.package_id].add(normalized_hash)
+        declarations_by_identity[(source.package_id, normalized_hash)].append(source)
         if re.fullmatch(r"[0-9a-fA-F]{64}", source.root_sha256) is None:
             findings.append(
                 LineageFinding(
@@ -113,9 +116,21 @@ def build_lineage(sources: Sequence[SourcePackage]) -> LineageGraph:
                 )
             )
 
+    for (package_id, _root_hash), declarations in sorted(declarations_by_identity.items()):
+        metadata = {_controlling_metadata(source) for source in declarations}
+        if len(metadata) > 1:
+            findings.append(
+                LineageFinding(
+                    "metadata-conflict",
+                    (package_id,),
+                    "duplicate package identity has conflicting parent, status, or current metadata",
+                )
+            )
+
     children: dict[str, set[str]] = defaultdict(set)
     indegree = {package_id: 0 for package_id in by_id}
-    for package_id, source in sorted(by_id.items()):
+    for source in sorted(sources, key=_source_sort_key):
+        package_id = source.package_id
         for parent_id in sorted(set(source.parent_ids)):
             if parent_id not in by_id:
                 findings.append(
@@ -125,6 +140,11 @@ def build_lineage(sources: Sequence[SourcePackage]) -> LineageGraph:
                         f"package {package_id!r} names missing parent {parent_id!r}",
                     )
                 )
+                continue
+
+    for package_id, source in sorted(by_id.items()):
+        for parent_id in sorted(set(source.parent_ids)):
+            if parent_id not in by_id:
                 continue
             if package_id not in children[parent_id]:
                 children[parent_id].add(package_id)
@@ -148,12 +168,17 @@ def build_lineage(sources: Sequence[SourcePackage]) -> LineageGraph:
         )
 
     current_ids = tuple(
-        sorted(source.package_id for source in by_id.values() if source.declared_current_root)
+        sorted({source.package_id for source in sources if source.declared_current_root})
     )
     superseded_current_ids = tuple(
-        package_id
-        for package_id in current_ids
-        if by_id[package_id].status is PackageStatus.SUPERSEDED
+        sorted(
+            {
+                source.package_id
+                for source in sources
+                if source.declared_current_root
+                and source.status is PackageStatus.SUPERSEDED
+            }
+        )
     )
     for package_id in superseded_current_ids:
         findings.append(
@@ -176,6 +201,7 @@ def build_lineage(sources: Sequence[SourcePackage]) -> LineageGraph:
         in {
             "identity-collision",
             "invalid-root-sha256",
+            "metadata-conflict",
             "missing-parent",
             "no-sources",
             "cycle",
@@ -232,4 +258,12 @@ def _source_sort_key(source: SourcePackage) -> tuple[object, ...]:
         tuple(sorted(source.parent_ids)),
         source.declared_current_root,
         source.created_at or "",
+    )
+
+
+def _controlling_metadata(source: SourcePackage) -> tuple[object, ...]:
+    return (
+        source.status,
+        tuple(sorted(set(source.parent_ids))),
+        source.declared_current_root,
     )

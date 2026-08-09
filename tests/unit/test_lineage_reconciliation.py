@@ -124,6 +124,45 @@ def test_duplicate_package_id_with_different_hash_is_invalid() -> None:
     assert any(finding.code == "identity-collision" for finding in graph.findings)
 
 
+def test_same_identity_with_conflicting_parents_validates_every_declaration() -> None:
+    """Catches duplicate collapsing that hides a missing parent declaration."""
+    root_sha256 = hashlib.sha256(b"duplicate").hexdigest()
+    graph = build_lineage(
+        (
+            _package("duplicate", root_sha256=root_sha256),
+            _package("duplicate", root_sha256=root_sha256, parents=("absent",)),
+        )
+    )
+
+    assert graph.state is LineageState.INVALID
+    assert any(finding.code == "metadata-conflict" for finding in graph.findings)
+    assert any(finding.code == "missing-parent" for finding in graph.findings)
+
+
+def test_same_identity_with_conflicting_current_status_metadata_is_invalid() -> None:
+    """Catches duplicate collapsing that hides a superseded-current declaration."""
+    root_sha256 = hashlib.sha256(b"duplicate-current").hexdigest()
+    graph = build_lineage(
+        (
+            _package(
+                "duplicate",
+                root_sha256=root_sha256,
+                status=PackageStatus.CANDIDATE,
+            ),
+            _package(
+                "duplicate",
+                root_sha256=root_sha256,
+                status=PackageStatus.SUPERSEDED,
+                current=True,
+            ),
+        )
+    )
+
+    assert graph.state is LineageState.INVALID
+    assert any(finding.code == "metadata-conflict" for finding in graph.findings)
+    assert any(finding.code == "superseded-current" for finding in graph.findings)
+
+
 def test_malformed_root_sha256_is_invalid() -> None:
     """Catches a non-hash package identity entering lineage comparisons."""
     graph = build_lineage((_package("source", root_sha256="not-a-sha256"),))
@@ -266,6 +305,26 @@ def test_hash_mismatch_is_retained_but_cannot_control_selection() -> None:
     assert report.findings[0].evidence_state is EvidenceState.CONTRADICTED
     assert report.findings[0].expected_sha256 == "a" * 64
     assert report.findings[0].observed_sha256 == "b" * 64
+
+
+def test_global_invalid_integrity_is_combined_with_source_verified_finding() -> None:
+    """Catches source-specific evidence replacing a controlling global failure."""
+    claim = _claim("claim-source", "behavior", "retry", "source")
+    global_failure = _integrity(
+        "integrity-global",
+        "*",
+        EvidenceState.CONTRADICTED,
+        detail="global package manifest hash mismatch",
+    )
+    source_pass = _integrity("integrity-source", "source")
+
+    report = reconcile_sources((claim,), (), (source_pass, global_failure))
+
+    assert report.selected_claim_ids == ()
+    assert {finding.finding_id for finding in report.findings} == {
+        "integrity-global",
+        "integrity-source",
+    }
 
 
 def test_broad_urgency_cannot_override_narrow_safety_prohibition() -> None:
@@ -454,6 +513,39 @@ def test_successor_claim_without_valid_lineage_is_retained_but_not_selected() ->
 
     assert report.selected_claim_ids == ()
     assert report.findings[0].lineage_valid is False
+
+
+def test_successor_claim_without_affirmative_lineage_proof_cannot_control() -> None:
+    """Catches a successor claim passing because missing lineage proof defaults valid."""
+    claim = _claim("claim-successor", "authority", "current", "successor")
+    missing_lineage_proof = _integrity(
+        "integrity-successor-missing-lineage",
+        "successor",
+        EvidenceState.VERIFIED,
+        lineage_required=True,
+    )
+
+    report = reconcile_sources((claim,), (), (missing_lineage_proof,))
+
+    assert report.selected_claim_ids == ()
+    assert report.findings[0].lineage_required is True
+    assert report.findings[0].lineage_valid is None
+
+
+def test_successor_claim_with_affirmative_lineage_proof_can_control() -> None:
+    """Catches affirmative validated successor lineage being treated as absent."""
+    claim = _claim("claim-linked-successor", "authority", "current", "successor")
+    valid_lineage = _integrity(
+        "integrity-successor-valid-lineage",
+        "successor",
+        EvidenceState.VERIFIED,
+        lineage_required=True,
+        lineage_valid=True,
+    )
+
+    report = reconcile_sources((claim,), (), (valid_lineage,))
+
+    assert report.selected_claim_ids == (claim.claim_id,)
 
 
 def test_report_serialization_sorts_every_record_collection_by_stable_id() -> None:
