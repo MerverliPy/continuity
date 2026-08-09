@@ -91,6 +91,34 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
     )
 
 
+def _resolved_report() -> ReconciliationReport:
+    blocked = _report(blocked=True)
+    approval = ApprovalRecord(
+        "approval-architecture",
+        "resolve-conflict",
+        ("conflict-architecture",),
+        "claim-monolith",
+        "user",
+        "conversation://resolution/architecture",
+        "2026-08-09T11:00:00Z",
+    )
+    conflict = ConflictRecord(
+        "conflict-architecture",
+        "architecture",
+        True,
+        ("claim-monolith", "claim-services"),
+        approval.approval_id,
+    )
+    return ReconciliationReport(
+        claims=blocked.claims,
+        approvals=(approval,),
+        findings=blocked.findings,
+        conflicts=(conflict,),
+        selected_claim_ids=("project-alpha", "claim-monolith"),
+        notes=(),
+    )
+
+
 def _request(
     tmp_path: Path,
     *,
@@ -412,6 +440,54 @@ def test_validation_requires_exactly_one_selected_project_claim(
 
     assert not validation.valid
     assert any("exactly one project_id" in violation for violation in validation.violations)
+
+
+@pytest.mark.parametrize(
+    ("disputed_selection", "expected_valid"),
+    (
+        (("claim-monolith",), True),
+        (("claim-services",), False),
+        (("claim-monolith", "claim-services"), False),
+        ((), False),
+    ),
+    ids=("approved", "opposite", "both", "none"),
+)
+def test_resolved_conflict_selects_exactly_the_approved_disputed_claim(
+    tmp_path: Path,
+    disputed_selection: tuple[str, ...],
+    expected_valid: bool,
+) -> None:
+    """Catches conflict approval diverging from the disputed claim selection."""
+    result = build_candidate(_request(tmp_path, report=_resolved_report()))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["selected_claim_ids"] = ["project-alpha", *disputed_selection]
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert validation.valid is expected_valid
+    if not expected_valid:
+        assert any(
+            "approved disputed claim" in violation
+            for violation in validation.violations
+        )
+
+
+def test_unresolved_material_conflict_selects_no_disputed_claim(tmp_path: Path) -> None:
+    """Catches an unresolved conflict silently choosing one disputed alternative."""
+    result = build_candidate(_request(tmp_path, report=_report(blocked=True)))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["selected_claim_ids"].append("claim-monolith")
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("unresolved disputed claim" in item for item in validation.violations)
 
 
 def test_candidate_zip_has_sorted_entries_and_fixed_metadata(tmp_path: Path) -> None:

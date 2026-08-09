@@ -1043,6 +1043,28 @@ def _validate_reconciliation_structure(
             violations.append(
                 f"reconciliation selected_claim_ids references absent claim {claim_id}"
             )
+    selected_set = set(selected)
+    for conflict_id, conflict in conflicts_by_id.items():
+        disputed = conflict.get("claim_ids")
+        if not isinstance(disputed, list) or any(
+            not isinstance(claim_id, str) for claim_id in disputed
+        ):
+            continue
+        selected_disputed = selected_set & set(disputed)
+        resolution_id = conflict.get("resolution_approval_id")
+        if isinstance(resolution_id, str) and resolution_id.strip():
+            approval = approvals_by_id.get(resolution_id)
+            decision = approval.get("decision") if approval is not None else None
+            expected = {decision} if isinstance(decision, str) else set()
+            if selected_disputed != expected:
+                violations.append(
+                    f"reconciliation conflict {conflict_id} must select exactly the "
+                    "approved disputed claim"
+                )
+        elif conflict.get("material") is True and selected_disputed:
+            violations.append(
+                f"reconciliation conflict {conflict_id} selects an unresolved disputed claim"
+            )
 
     blocking = _validate_exact_string_list(
         reconciliation.get("blocking_conflict_ids"),
