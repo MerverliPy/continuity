@@ -57,6 +57,7 @@ def _integrity(
     state: EvidenceState = EvidenceState.VERIFIED,
     **kwargs: object,
 ) -> IntegrityFinding:
+    kwargs.setdefault("lineage_required", False)
     return IntegrityFinding(finding_id, source_id, state, **kwargs)
 
 
@@ -530,6 +531,37 @@ def test_successor_claim_without_affirmative_lineage_proof_cannot_control() -> N
     assert report.selected_claim_ids == ()
     assert report.findings[0].lineage_required is True
     assert report.findings[0].lineage_valid is None
+
+
+def test_unknown_lineage_is_noncontrolling_by_default() -> None:
+    """Catches omitted lineage applicability silently exempting a source."""
+    claim = _claim("claim-default-lineage", "authority", "current", "unknown")
+    unknown_lineage = IntegrityFinding(
+        "integrity-default-lineage",
+        "unknown",
+        EvidenceState.VERIFIED,
+    )
+
+    report = reconcile_sources((claim,), (), (unknown_lineage,))
+
+    assert report.selected_claim_ids == ()
+    assert report.findings[0].lineage_required is True
+    assert report.findings[0].lineage_valid is None
+
+
+def test_trusted_non_successor_can_explicitly_exempt_lineage() -> None:
+    """Catches the standalone/root exemption being lost under fail-closed defaults."""
+    claim = _claim("claim-root-fact", "title", "Continuity", "trusted-root")
+    trusted_root = IntegrityFinding(
+        "integrity-root",
+        "trusted-root",
+        EvidenceState.VERIFIED,
+        lineage_required=False,
+    )
+
+    report = reconcile_sources((claim,), (), (trusted_root,))
+
+    assert report.selected_claim_ids == (claim.claim_id,)
 
 
 def test_successor_claim_with_affirmative_lineage_proof_can_control() -> None:

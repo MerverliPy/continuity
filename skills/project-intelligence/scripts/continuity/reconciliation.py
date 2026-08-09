@@ -32,7 +32,7 @@ class IntegrityFinding:
     detail: str = ""
     structurally_valid: bool | None = None
     lineage_valid: bool | None = None
-    lineage_required: bool = False
+    lineage_required: bool = True
     expected_sha256: str | None = None
     observed_sha256: str | None = None
 
