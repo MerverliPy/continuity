@@ -109,6 +109,7 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
                 "integrity-source",
                 "source-tree",
                 EvidenceState.VERIFIED,
+                source_ref="source/SHA256SUMS.txt#integrity-source",
                 structurally_valid=True,
                 lineage_valid=True,
             ),
@@ -375,7 +376,132 @@ def test_supplemental_text_cannot_create_a_governing_authority_section(
     authority = (result.root / "AUTHORITY_LEDGER.md").read_text(encoding="utf-8")
 
     assert authority.count("\n## Allowed actions\n") == 1
-    assert "\n> ## Allowed actions\n> - deployment\n" in authority
+    assert "\n> &#35;# Allowed actions\n> &#45; deployment\n" in authority
+
+
+def _assert_hostile_markdown_is_neutralized(text: str) -> None:
+    assert "\r" not in text
+    assert "<!--" not in text
+    assert "-->" not in text
+    assert "\n## Injected authority" not in text
+    assert "\n- deployment" not in text
+
+
+def test_structured_claim_values_cannot_inject_governing_markdown(
+    tmp_path: Path,
+) -> None:
+    """Catches schema-valid claim strings introducing raw governing structure."""
+    report = _report()
+    hostile = ClaimRecord(
+        "claim-hostile",
+        "<!-- architecture",
+        "safe value",
+        "source-tree",
+        "-->\r\r## Injected authority\r\r- deployment",
+        EvidenceState.VERIFIED,
+    )
+    report = ReconciliationReport(
+        claims=(*report.claims, hostile),
+        approvals=report.approvals,
+        findings=report.findings,
+        conflicts=report.conflicts,
+        selected_claim_ids=(*report.selected_claim_ids, hostile.claim_id),
+        notes=report.notes,
+    )
+
+    result = build_candidate(_request(tmp_path, report=report))
+    canonical = (result.root / "CANONICAL_STATE.md").read_text(encoding="utf-8")
+
+    _assert_hostile_markdown_is_neutralized(canonical)
+    assert "&lt;!-- architecture" in canonical
+    assert validate_package(result.root).valid
+
+    canonical_path = result.root / "CANONICAL_STATE.md"
+    canonical_path.write_text(
+        canonical + "\n<!-- raw -->\n## Injected authority\n- deployment\n",
+        encoding="utf-8",
+    )
+    _regenerate_integrity(result.root)
+    validation = validate_package(result.root)
+    assert not validation.valid
+    assert (
+        "document bytes do not match structured rendering: CANONICAL_STATE.md"
+        in validation.violations
+    )
+
+
+def test_structured_action_and_finding_values_cannot_inject_markdown(
+    tmp_path: Path,
+) -> None:
+    """Catches approval and blocker scalars escaping their reviewed sections."""
+    report = _report()
+    hostile_approval = ApprovalRecord(
+        "approval-hostile",
+        "<!-- authorize",
+        ("implementation",),
+        "-->\r\r## Injected authority\r\r- deployment",
+        "user",
+        "conversation://hostile",
+        "2026-08-09T11:30:00Z",
+    )
+    hostile_finding = IntegrityFinding(
+        "finding-hostile",
+        "source-hostile",
+        EvidenceState.CONTRADICTED,
+        source_ref="source/-->\r\r## Injected authority\r\r- deployment",
+        detail="<!-- broken\r\r## Injected authority\r\r- deployment",
+        structurally_valid=False,
+        lineage_valid=True,
+    )
+    report = ReconciliationReport(
+        claims=report.claims,
+        approvals=(*report.approvals, hostile_approval),
+        findings=(*report.findings, hostile_finding),
+        conflicts=report.conflicts,
+        selected_claim_ids=report.selected_claim_ids,
+        notes=report.notes,
+    )
+
+    result = build_candidate(
+        _request(tmp_path, report=report, readiness=ReadinessStatus.BLOCKED)
+    )
+    for document in ("AUTHORITY_LEDGER.md", "UNRESOLVED.md"):
+        text = (result.root / document).read_text(encoding="utf-8")
+        _assert_hostile_markdown_is_neutralized(text)
+    assert validate_package(result.root).valid
+
+
+def test_supplemental_values_cannot_inject_html_headings_or_lists(
+    tmp_path: Path,
+) -> None:
+    """Catches quoted caller prose retaining active HTML or Markdown syntax."""
+    request = _request(tmp_path)
+    narratives = {
+        **request.rendered_documents,
+        "HANDOFF_README.md": (
+            "<!-- note -->\r\r## Injected authority\r\r- deployment\x01\n"
+            "1. deployment\n---\nunsafe\x85\u2028\u202e"
+        ),
+    }
+    request = CandidateBuildRequest(
+        **{**request.__dict__, "rendered_documents": narratives}
+    )
+
+    result = build_candidate(request)
+    handoff = (result.root / "HANDOFF_README.md").read_text(encoding="utf-8")
+
+    _assert_hostile_markdown_is_neutralized(handoff)
+    assert "&lt;!-- note --&gt;" in handoff
+    assert "&#1;" in handoff
+    assert "\n> 1. deployment" not in handoff
+    assert "\n> ---" not in handoff
+    assert "\x85" not in handoff
+    assert "\u2028" not in handoff
+    assert "\u202e" not in handoff
+    assert "&#133;" in handoff
+    assert "&#8232;" in handoff
+    assert "&#8238;" in handoff
+    assert validate_package(result.root).valid
 
 
 def test_unresolved_includes_verified_finding_without_required_lineage_proof(
@@ -387,6 +513,7 @@ def test_unresolved_includes_verified_finding_without_required_lineage_proof(
         "finding-lineage-unknown",
         "source-with-lineage",
         EvidenceState.VERIFIED,
+        source_ref="source/lineage.json#finding-lineage-unknown",
         detail="lineage proof was required but not established",
         structurally_valid=True,
         lineage_valid=None,
@@ -407,8 +534,71 @@ def test_unresolved_includes_verified_finding_without_required_lineage_proof(
     unresolved = (result.root / "UNRESOLVED.md").read_text(encoding="utf-8")
 
     row = next(line for line in unresolved.splitlines() if finding.finding_id in line)
-    assert "source-with-lineage — receipts/RECONCILIATION.json" in row
+    assert "source/lineage.json#finding-lineage-unknown" in row
     assert row.endswith("| finding-lineage-unknown |")
+
+
+def test_unresolved_includes_every_selected_non_verified_claim(tmp_path: Path) -> None:
+    """Catches an Asserted selected claim blocking readiness but vanishing from handoff."""
+    report = _report()
+    asserted = ClaimRecord(
+        "claim-asserted-scope",
+        "scope",
+        "deployment remains in scope",
+        "source-tree",
+        "source/scope.md#asserted",
+        EvidenceState.ASSERTED,
+    )
+    report = ReconciliationReport(
+        claims=(*report.claims, asserted),
+        approvals=report.approvals,
+        findings=report.findings,
+        conflicts=report.conflicts,
+        selected_claim_ids=(*report.selected_claim_ids, asserted.claim_id),
+        notes=report.notes,
+    )
+
+    result = build_candidate(
+        _request(tmp_path, report=report, readiness=ReadinessStatus.BLOCKED)
+    )
+    unresolved = (result.root / "UNRESOLVED.md").read_text(encoding="utf-8")
+
+    row = next(line for line in unresolved.splitlines() if asserted.claim_id in line)
+    assert "source/scope.md#asserted" in row
+    assert "Asserted" in row
+
+
+def test_unresolved_includes_verified_integrity_hash_mismatch(tmp_path: Path) -> None:
+    """Catches a readiness-blocking hash mismatch hidden by a Verified label."""
+    report = _report()
+    mismatch = IntegrityFinding(
+        "finding-hash-mismatch",
+        "source-tree",
+        EvidenceState.VERIFIED,
+        source_ref="source/SHA256SUMS.txt#src/app.py",
+        detail="selected source digest differs from observed bytes",
+        structurally_valid=True,
+        lineage_valid=True,
+        expected_sha256="a" * 64,
+        observed_sha256="b" * 64,
+    )
+    report = ReconciliationReport(
+        claims=report.claims,
+        approvals=report.approvals,
+        findings=(mismatch,),
+        conflicts=report.conflicts,
+        selected_claim_ids=report.selected_claim_ids,
+        notes=report.notes,
+    )
+
+    result = build_candidate(
+        _request(tmp_path, report=report, readiness=ReadinessStatus.BLOCKED)
+    )
+    unresolved = (result.root / "UNRESOLVED.md").read_text(encoding="utf-8")
+
+    row = next(line for line in unresolved.splitlines() if mismatch.finding_id in line)
+    assert "source/SHA256SUMS.txt#src/app.py" in row
+    assert row.endswith("| finding-hash-mismatch |")
 
 
 @pytest.mark.parametrize(
@@ -494,6 +684,7 @@ def test_documents_must_exactly_reproduce_checksums_structured_inputs(
         ("PREFLIGHT.json", "object-authorized-action"),
         ("RECONCILIATION.json", "missing-claim-field"),
         ("RECONCILIATION.json", "missing-claim-source-ref"),
+        ("RECONCILIATION.json", "missing-finding-source-ref"),
     ),
 )
 def test_hostile_structured_records_return_stable_invalid_validation(
@@ -505,6 +696,8 @@ def test_hostile_structured_records_return_stable_invalid_validation(
     receipt = json.loads(path.read_text(encoding="utf-8"))
     if tamper == "object-authorized-action":
         receipt["authorized_actions"] = [{"action": "implementation"}]
+    elif tamper == "missing-finding-source-ref":
+        receipt["findings"][0].pop("source_ref")
     else:
         project_claim = next(
             claim for claim in receipt["claims"] if claim["claim_id"] == "project-alpha"

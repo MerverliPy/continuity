@@ -45,6 +45,7 @@ _INTEGRITY_FIELDS = frozenset(
     {
         "finding_id",
         "source_id",
+        "source_ref",
         "evidence_state",
         "detail",
         "structurally_valid",
@@ -229,6 +230,7 @@ def _inspect_directory(source: Path, source_id: str) -> _CommandResult:
         finding_id=_finding_id(source_id),
         source_id=source_id,
         evidence_state=state,
+        source_ref=f"directory://{source.name}",
         detail=detail,
         structurally_valid=state is EvidenceState.VERIFIED,
         lineage_valid=None,
@@ -297,6 +299,7 @@ def _inspect_archive(source: Path, source_id: str) -> _CommandResult:
         finding_id=_finding_id(source_id),
         source_id=source_id,
         evidence_state=state,
+        source_ref=f"zip://{source.name}",
         detail=code,
         structurally_valid=state is EvidenceState.VERIFIED,
         lineage_valid=None,
@@ -635,6 +638,7 @@ def _parse_integrity(value: Mapping[str, object]) -> IntegrityFinding:
         evidence_state=_enum(
             EvidenceState, value.get("evidence_state"), "integrity evidence_state"
         ),
+        source_ref=_required_text(value.get("source_ref"), "integrity source_ref"),
         detail=_text(value.get("detail"), "integrity detail"),
         structurally_valid=_optional_boolean(
             value.get("structurally_valid"), "structurally_valid"

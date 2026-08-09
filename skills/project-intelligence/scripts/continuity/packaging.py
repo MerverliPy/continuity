@@ -15,6 +15,7 @@ import re
 import shutil
 import stat
 import tempfile
+import unicodedata
 import zipfile
 
 from .hashing import inventory_tree, sha256_file, verify_sha256s, write_sha256s
@@ -28,7 +29,11 @@ from .models import (
     ReadinessStatus,
 )
 from .paths import normalize_relative_path
-from .reconciliation import IntegrityFinding, ReconciliationReport
+from .reconciliation import (
+    IntegrityFinding,
+    ReconciliationReport,
+    integrity_finding_permits_automatic_selection,
+)
 from .redaction import redact_text
 from .readiness import classify_readiness
 
@@ -710,11 +715,11 @@ def _render_documents_from_structured_inputs(
     approval_rows = _approval_rows(report)
     conflict_rows = _conflict_rows(report)
     unresolved_rows = _unresolved_rows(report, preflight)
-    package_id = str(identity["package_id"])
-    project_id = str(identity["project_id"])
-    created_at = str(identity["created_at"])
-    status = str(identity["status"])
-    readiness = str(identity["readiness"])
+    package_id = _markdown_text(identity["package_id"])
+    project_id = _markdown_text(identity["project_id"])
+    created_at = _markdown_text(identity["created_at"])
+    status = _markdown_text(identity["status"])
+    readiness = _markdown_text(identity["readiness"])
     exact_next_action = preflight.get("exact_next_action")
     companion = preflight.get("companion_skill_or_stage")
     lifecycle_notice = {
@@ -827,8 +832,11 @@ def _render_documents_from_structured_inputs(
 def _supplemental_narrative(value: object) -> str:
     """Keep caller prose visibly quoted and outside governing Markdown sections."""
 
-    lines = str(value).splitlines()
-    return "\n".join(f"> {line}" if line else ">" for line in lines) or ">"
+    normalized = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    return "\n".join(
+        f"> {_markdown_text(line)}" if line else ">" for line in lines
+    ) or ">"
 
 
 def _selected_claim_rows(report: ReconciliationReport | Mapping[str, object]) -> list[str]:
@@ -918,13 +926,19 @@ def _unresolved_rows(
     preflight: PreflightRecord | Mapping[str, object],
 ) -> list[str]:
     rows: list[str] = []
+    selected = set(_report_mapping(report).get("selected_claim_ids", ()))
     for claim in _report_records(report, "claims"):
         state = claim.get("evidence_state")
-        if state not in {
+        unresolved_state = state in {
             EvidenceState.UNRESOLVED.value,
             EvidenceState.CONTRADICTED.value,
             EvidenceState.MISSING.value,
-        }:
+        }
+        selected_non_verified = (
+            claim.get("claim_id") in selected
+            and state != EvidenceState.VERIFIED.value
+        )
+        if not unresolved_state and not selected_non_verified:
             continue
         rows.append(
             _unresolved_row(
@@ -943,7 +957,7 @@ def _unresolved_rows(
                 finding.get("detail") or "integrity finding",
                 "Blocks trusted package use",
                 finding.get("evidence_state"),
-                f'{finding.get("source_id")} — receipts/RECONCILIATION.json',
+                f'{finding.get("source_id")} — {finding.get("source_ref")}',
                 finding.get("finding_id"),
             )
         )
@@ -977,17 +991,22 @@ def _unresolved_rows(
 
 
 def _finding_permits_automatic_selection(finding: Mapping[str, object]) -> bool:
-    state_verified = finding.get("evidence_state") == EvidenceState.VERIFIED.value
-    structurally_valid = finding.get("structurally_valid")
-    structural_gate = (
-        state_verified if structurally_valid is None else structurally_valid is True
+    return integrity_finding_permits_automatic_selection(
+        evidence_state=EvidenceState(str(finding.get("evidence_state"))),
+        structurally_valid=finding.get("structurally_valid"),
+        lineage_valid=finding.get("lineage_valid"),
+        lineage_required=finding.get("lineage_required") is True,
+        expected_sha256=(
+            str(finding["expected_sha256"])
+            if finding.get("expected_sha256") is not None
+            else None
+        ),
+        observed_sha256=(
+            str(finding["observed_sha256"])
+            if finding.get("observed_sha256") is not None
+            else None
+        ),
     )
-    lineage_valid = finding.get("lineage_valid")
-    lineage_required = finding.get("lineage_required") is True
-    lineage_gate = lineage_valid is not False and (
-        not lineage_required or lineage_valid is True
-    )
-    return state_verified and structural_gate and lineage_gate
 
 
 def _unresolved_row(
@@ -1020,7 +1039,38 @@ def _markdown_list(values: Sequence[object]) -> str:
 
 
 def _markdown_text(value: object) -> str:
-    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+    normalized = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    encoded: list[str] = []
+    for character in normalized:
+        codepoint = ord(character)
+        if character == "&":
+            encoded.append("&amp;")
+        elif character == "<":
+            encoded.append("&lt;")
+        elif character == ">":
+            encoded.append("&gt;")
+        elif character == "|":
+            encoded.append("&#124;")
+        elif character == "\\":
+            encoded.append("&#92;")
+        elif character == "`":
+            encoded.append("&#96;")
+        elif character == "\n":
+            encoded.append("&#10;")
+        elif unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
+            encoded.append(f"&#{codepoint};")
+        else:
+            encoded.append(character)
+    text = "".join(encoded)
+    return re.sub(
+        r"(^|&#10;)(\s*)(#{1,6}(?=\s|$)|[-+*>](?=\s)|"
+        r"[0-9]{1,9}[.)](?=\s)|[-=]{3,}(?=\s|$))",
+        lambda match: (
+            f"{match.group(1)}{match.group(2)}&#{ord(match.group(3)[0])};"
+            f"{match.group(3)[1:]}"
+        ),
+        text,
+    )
 
 
 def _markdown_value(value: object) -> str:
@@ -1030,7 +1080,7 @@ def _markdown_value(value: object) -> str:
 
 
 def _display_optional(value: str | None) -> str:
-    return value if value is not None else "null"
+    return _markdown_text(value) if value is not None else "null"
 
 
 def _report_mapping(
@@ -1132,6 +1182,7 @@ def _serialized_preflight_matches_report(
                     finding_id=str(item["finding_id"]),
                     source_id=str(item["source_id"]),
                     evidence_state=EvidenceState(str(item["evidence_state"])),
+                    source_ref=str(item["source_ref"]),
                     detail=str(item["detail"]),
                     structurally_valid=item.get("structurally_valid"),
                     lineage_valid=item.get("lineage_valid"),
@@ -2172,6 +2223,7 @@ def _validate_reconciliation_structure(
         label = f"reconciliation finding {index}"
         _record_id(finding, "finding_id", label, finding_ids, violations)
         _nonempty_string(finding.get("source_id"), f"{label} source_id", violations)
+        _nonempty_string(finding.get("source_ref"), f"{label} source_ref", violations)
         _enum_value(
             EvidenceState,
             finding.get("evidence_state"),

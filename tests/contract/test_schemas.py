@@ -83,6 +83,7 @@ def _documents() -> dict[str, dict[str, object]]:
                 {
                     "finding_id": "finding-source-alpha",
                     "source_id": "source-alpha",
+                    "source_ref": "canonical/SHA256SUMS.txt#finding-source-alpha",
                     "evidence_state": "Verified",
                     "detail": "checksum and lineage verified",
                     "structurally_valid": True,
@@ -201,6 +202,15 @@ def test_reconciliation_authority_records_are_strict(repo_root: Path) -> None:
             "implicit_scope": ["deployment"],
         }
     ]
+
+    assert list(validator.iter_errors(document))
+
+
+def test_integrity_finding_requires_direct_source_reference(repo_root: Path) -> None:
+    """Catches blocker provenance being replaced by a generic receipt citation."""
+    validator = Draft202012Validator(_schema(repo_root, "reconciliation"))
+    document = _documents()["reconciliation"]
+    del document["findings"][0]["source_ref"]  # type: ignore[index]
 
     assert list(validator.iter_errors(document))
 

@@ -29,6 +29,7 @@ class IntegrityFinding:
     finding_id: str
     source_id: str
     evidence_state: EvidenceState
+    source_ref: str
     detail: str = ""
     structurally_valid: bool | None = None
     lineage_valid: bool | None = None
@@ -38,20 +39,20 @@ class IntegrityFinding:
 
     @property
     def permits_automatic_selection(self) -> bool:
-        structural_gate = (
-            self.evidence_state is EvidenceState.VERIFIED
-            if self.structurally_valid is None
-            else self.structurally_valid
+        return integrity_finding_permits_automatic_selection(
+            evidence_state=self.evidence_state,
+            structurally_valid=self.structurally_valid,
+            lineage_valid=self.lineage_valid,
+            lineage_required=self.lineage_required,
+            expected_sha256=self.expected_sha256,
+            observed_sha256=self.observed_sha256,
         )
-        lineage_gate = self.lineage_valid is not False and (
-            not self.lineage_required or self.lineage_valid is True
-        )
-        return structural_gate and lineage_gate and self.evidence_state is EvidenceState.VERIFIED
 
     def to_dict(self) -> dict[str, object]:
         return {
             "finding_id": self.finding_id,
             "source_id": self.source_id,
+            "source_ref": self.source_ref,
             "evidence_state": self.evidence_state.value,
             "detail": self.detail,
             "structurally_valid": self.structurally_valid,
@@ -60,6 +61,38 @@ class IntegrityFinding:
             "expected_sha256": self.expected_sha256,
             "observed_sha256": self.observed_sha256,
         }
+
+
+def integrity_finding_permits_automatic_selection(
+    *,
+    evidence_state: EvidenceState,
+    structurally_valid: bool | None,
+    lineage_valid: bool | None,
+    lineage_required: bool,
+    expected_sha256: str | None,
+    observed_sha256: str | None,
+) -> bool:
+    """Apply the one integrity blocker policy used by reconciliation and handoffs."""
+
+    structural_gate = (
+        evidence_state is EvidenceState.VERIFIED
+        if structurally_valid is None
+        else structurally_valid
+    )
+    lineage_gate = lineage_valid is not False and (
+        not lineage_required or lineage_valid is True
+    )
+    digest_gate = not (
+        expected_sha256 is not None
+        and observed_sha256 is not None
+        and expected_sha256 != observed_sha256
+    )
+    return (
+        evidence_state is EvidenceState.VERIFIED
+        and structural_gate
+        and lineage_gate
+        and digest_gate
+    )
 
 
 @dataclass(frozen=True)
@@ -156,6 +189,7 @@ def reconcile_sources(
                         finding_id=_missing_integrity_id(claim.source_id),
                         source_id=claim.source_id,
                         evidence_state=EvidenceState.UNRESOLVED,
+                        source_ref=f"reconciliation://missing-integrity/{claim.source_id}",
                         detail="no structural integrity evidence was supplied",
                     )
                 )

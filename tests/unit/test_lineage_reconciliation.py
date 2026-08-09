@@ -58,6 +58,7 @@ def _integrity(
     **kwargs: object,
 ) -> IntegrityFinding:
     kwargs.setdefault("lineage_required", False)
+    kwargs.setdefault("source_ref", f"source://{source_id}/{finding_id}")
     return IntegrityFinding(finding_id, source_id, state, **kwargs)
 
 
@@ -308,6 +309,25 @@ def test_hash_mismatch_is_retained_but_cannot_control_selection() -> None:
     assert report.findings[0].observed_sha256 == "b" * 64
 
 
+def test_verified_label_cannot_override_expected_observed_hash_mismatch() -> None:
+    """Catches the shared blocker predicate trusting a contradictory digest pair."""
+    claim = _claim("claim-bad-verified", "behavior", "deploy", "broken")
+    mismatch = _integrity(
+        "integrity-bad-verified",
+        "broken",
+        EvidenceState.VERIFIED,
+        structurally_valid=True,
+        lineage_valid=True,
+        expected_sha256="a" * 64,
+        observed_sha256="b" * 64,
+    )
+
+    report = reconcile_sources((claim,), (), (mismatch,))
+
+    assert mismatch.permits_automatic_selection is False
+    assert report.selected_claim_ids == ()
+
+
 def test_global_invalid_integrity_is_combined_with_source_verified_finding() -> None:
     """Catches source-specific evidence replacing a controlling global failure."""
     claim = _claim("claim-source", "behavior", "retry", "source")
@@ -540,6 +560,7 @@ def test_unknown_lineage_is_noncontrolling_by_default() -> None:
         "integrity-default-lineage",
         "unknown",
         EvidenceState.VERIFIED,
+        source_ref="source://unknown/integrity-default-lineage",
     )
 
     report = reconcile_sources((claim,), (), (unknown_lineage,))
@@ -556,6 +577,7 @@ def test_trusted_non_successor_can_explicitly_exempt_lineage() -> None:
         "integrity-root",
         "trusted-root",
         EvidenceState.VERIFIED,
+        source_ref="source://trusted-root/integrity-root",
         lineage_required=False,
     )
 
@@ -606,6 +628,10 @@ def test_report_serialization_sorts_every_record_collection_by_stable_id() -> No
     assert [item["finding_id"] for item in serialized["findings"]] == [
         "integrity-a",
         "integrity-z",
+    ]
+    assert [item["source_ref"] for item in serialized["findings"]] == [
+        "source://a/integrity-a",
+        "source://z/integrity-z",
     ]
     assert [item["approval_id"] for item in serialized["approvals"]] == [
         "approval-a",

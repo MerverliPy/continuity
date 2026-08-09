@@ -59,6 +59,7 @@ def _report(
                 "integrity-canonical",
                 "canonical-package",
                 EvidenceState.VERIFIED,
+                source_ref="canonical/SHA256SUMS.txt#integrity-canonical",
                 structurally_valid=True,
                 lineage_valid=True,
             ),
@@ -77,6 +78,7 @@ _HASH_MISMATCH = IntegrityFinding(
     "integrity-hash-mismatch",
     "canonical-package",
     EvidenceState.CONTRADICTED,
+    source_ref="canonical/SHA256SUMS.txt#integrity-hash-mismatch",
     detail="checksum mismatch",
     structurally_valid=True,
     lineage_valid=True,
@@ -87,6 +89,7 @@ _MISSING_MANIFEST = IntegrityFinding(
     "integrity-required-manifest",
     "canonical-package",
     EvidenceState.MISSING,
+    source_ref="canonical/MANIFEST.json#integrity-required-manifest",
     detail="required manifest is missing",
     structurally_valid=False,
     lineage_valid=True,
@@ -132,10 +135,10 @@ def test_preflight_record_serializes_the_exact_v1_contract() -> None:
         "exact_next_action": "implementation",
         "companion_skill_or_stage": "superpowers:test-driven-development",
         "evidence_references": [
+            "canonical/SHA256SUMS.txt#integrity-canonical#integrity-canonical",
             "manifest.json#/authority-alpha#authority-alpha",
             "manifest.json#/lifecycle-alpha#lifecycle-alpha",
             "manifest.json#/project-alpha#project-alpha",
-            "receipts/RECONCILIATION.json#integrity-canonical",
         ],
     }
 

@@ -92,7 +92,7 @@ def classify_readiness(
             and finding.expected_sha256 != finding.observed_sha256
         ):
             block(f"integrity gate: hash mismatch in {finding.finding_id}")
-        if finding.evidence_state is EvidenceState.MISSING and "manifest" in _normalize(
+        elif finding.evidence_state is EvidenceState.MISSING and "manifest" in _normalize(
             finding.detail
         ):
             block(f"integrity gate: required manifest missing in {finding.finding_id}")
@@ -246,9 +246,9 @@ def _evidence_references(report: ReconciliationReport) -> tuple[str, ...]:
         if approval.source_ref.strip() and approval.approval_id.strip()
     )
     references.update(
-        f"receipts/RECONCILIATION.json#{finding.finding_id}"
+        f"{finding.source_ref}#{finding.finding_id}"
         for finding in report.findings
-        if finding.finding_id.strip()
+        if finding.source_ref.strip() and finding.finding_id.strip()
     )
     return tuple(sorted(references))
 

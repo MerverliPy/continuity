@@ -160,6 +160,19 @@ class ConflictRecord:
     resolution_approval_id: str | None
 
 @dataclass(frozen=True)
+class IntegrityFinding:
+    finding_id: str
+    source_id: str
+    evidence_state: EvidenceState
+    source_ref: str
+    detail: str = ""
+    structurally_valid: bool | None = None
+    lineage_valid: bool | None = None
+    lineage_required: bool = True
+    expected_sha256: str | None = None
+    observed_sha256: str | None = None
+
+@dataclass(frozen=True)
 class PreflightDecision:
     status: ReadinessStatus
     reasons: tuple[str, ...]
@@ -838,7 +851,7 @@ The skills must instruct the agent to:
 
 - [ ] **Step 6: Connect package rendering to the bundled templates and validate schemas.**
 
-Package construction must load assets relative to `packaging.py`, reject malformed, unbalanced, nested, unknown, missing, or unused template tokens, and render governing sections from the approved reconciliation report and exact `PreflightRecord`. Store every caller narrative in checksummed `receipts/DOCUMENT_INPUTS.json`; user text is supplemental only. Before checksums and publication, deterministically re-render all seven completed documents from strict structured receipts and package identity and require byte equality. Independent validation repeats exact reproduction only after schema/type checks; promotion re-renders successor bytes from the same supplemental receipt and successor identity/status/time.
+Package construction must load assets relative to `packaging.py`, reject malformed, unbalanced, nested, unknown, missing, or unused template tokens, and render governing sections from the approved reconciliation report and exact `PreflightRecord`. Every receipt-, identity-, or caller-derived Markdown scalar passes through one deterministic encoder that normalizes CR, encodes unsafe controls, escapes HTML/comment and table delimiters, and neutralizes heading/list syntax. Store every caller narrative in checksummed `receipts/DOCUMENT_INPUTS.json`; user text is supplemental only. Before checksums and publication, deterministically re-render all seven completed documents from strict structured receipts and package identity and require byte equality. Independent validation repeats exact reproduction only after schema/type checks; promotion re-renders successor bytes from the same supplemental receipt and successor identity/status/time. `UNRESOLVED.md` uses the readiness integrity predicate: every selected non-`Verified` claim and every finding that fails structural, lineage, EvidenceState, or expected/observed digest equality appears with its stable record ID and direct `source_ref`.
 
 - [ ] **Step 7: Run contract, unit, integration, and full tests.**
 

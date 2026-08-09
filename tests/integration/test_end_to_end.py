@@ -169,6 +169,7 @@ def _standalone_preflight_report() -> dict[str, object]:
             {
                 "finding_id": "finding-source",
                 "source_id": "source",
+                "source_ref": "source/SHA256SUMS.txt#finding-source",
                 "evidence_state": "Verified",
                 "detail": "checksum and lineage verified",
                 "structurally_valid": True,
@@ -238,6 +239,7 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
         assert payload["ok"] is True
         assert payload["operation"] == "inspect"
         assert payload["source"]["source_id"] == source_id
+        assert payload["integrity"]["source_ref"] == f"directory://{source_id}"
         assert not any(str(tmp_path) in json.dumps(item) for item in payload.values())
         _assert_output(output, payload)
         inspect_results[source_id] = payload
@@ -1065,6 +1067,7 @@ def test_zip_inspection_requires_verified_package_bytes(
     )
 
     assert payload["integrity"]["evidence_state"] == "Contradicted"
+    assert payload["integrity"]["source_ref"] == "zip://fabricated.zip"
     assert payload["archive"]["code"] == "package-validation-failed"
     assert "MANIFEST.json" not in json.dumps(payload)
 
@@ -1096,6 +1099,7 @@ def test_safe_non_package_zip_remains_unresolved(
     )
 
     assert payload["integrity"]["evidence_state"] == "Unresolved"
+    assert payload["integrity"]["source_ref"] == "zip://notes.zip"
     assert payload["archive"]["code"] == "package-integrity-evidence-incomplete"
 
 
