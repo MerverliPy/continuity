@@ -165,6 +165,33 @@ def test_readiness_uses_explicit_gates(
         assert decision.exact_next_action == "implementation"
 
 
+@pytest.mark.parametrize(
+    ("requested_action", "expected"),
+    (
+        ("fix bug", ReadinessStatus.BLOCKED),
+        ("modify source", ReadinessStatus.BLOCKED),
+        ("write feature", ReadinessStatus.BLOCKED),
+        ("review", ReadinessStatus.READY),
+    ),
+)
+def test_noncanonical_lifecycle_allows_only_explicit_safe_operations(
+    requested_action: str, expected: ReadinessStatus
+) -> None:
+    """Catches unknown mutating verbs bypassing the canonical lifecycle gate."""
+    report = _report(
+        authorized_actions=(requested_action,), package_status="Candidate"
+    )
+
+    decision = classify_readiness(report, requested_action)
+
+    assert decision.status is expected
+    if expected is ReadinessStatus.BLOCKED:
+        assert requested_action in decision.prohibited_actions
+        assert decision.exact_next_action is None
+    else:
+        assert decision.exact_next_action == requested_action
+
+
 def test_conditional_preserves_machine_readable_condition_and_citation() -> None:
     """Catches a prose-only unknown being treated as proven harmless."""
 
@@ -239,6 +266,109 @@ def test_action_named_approval_with_unrelated_scope_does_not_authorize() -> None
     assert "implementation" in decision.prohibited_actions
 
 
+def test_blank_requested_action_has_explicit_stable_prohibition() -> None:
+    """Catches invalid requests producing a blocked decision with no prohibition."""
+
+    decision = classify_readiness(_report(), "   ")
+
+    assert decision.status is ReadinessStatus.BLOCKED
+    assert "blank or invalid requested action" in decision.prohibited_actions
+    assert decision.exact_next_action is None
+
+
+def _report_with_material_resolution(
+    approval: ApprovalRecord | None,
+) -> ReconciliationReport:
+    selected = _claim("claim-monolith", "architecture", "monolith")
+    competing = _claim("claim-services", "architecture", "services")
+    conflict = ConflictRecord(
+        "conflict-resolved-architecture",
+        "architecture",
+        True,
+        (selected.claim_id, competing.claim_id),
+        "approval-resolution",
+    )
+    report = _report(
+        conflicts=(conflict,),
+        extra_claims=(selected, competing),
+        extra_selected=(selected.claim_id,),
+    )
+    return ReconciliationReport(
+        claims=report.claims,
+        approvals=() if approval is None else (approval,),
+        findings=report.findings,
+        conflicts=report.conflicts,
+        selected_claim_ids=report.selected_claim_ids,
+        notes=report.notes,
+    )
+
+
+@pytest.mark.parametrize(
+    "approval",
+    (
+        None,
+        ApprovalRecord(
+            "approval-resolution",
+            "approve-claim",
+            ("conflict-resolved-architecture",),
+            "claim-monolith",
+            "user",
+            "approval.md",
+            "2026-08-09T12:00:00Z",
+        ),
+        ApprovalRecord(
+            "approval-resolution",
+            "resolve-conflict",
+            ("conflict-other",),
+            "claim-monolith",
+            "user",
+            "approval.md",
+            "2026-08-09T12:00:00Z",
+        ),
+        ApprovalRecord(
+            "approval-resolution",
+            "resolve-conflict",
+            ("conflict-resolved-architecture",),
+            "claim-unrelated",
+            "user",
+            "approval.md",
+            "2026-08-09T12:00:00Z",
+        ),
+    ),
+    ids=("stale-id", "wrong-action", "wrong-scope", "fabricated-decision"),
+)
+def test_material_resolution_requires_exact_referenced_approval(
+    approval: ApprovalRecord | None,
+) -> None:
+    """Catches a non-null resolution ID bypassing exact approval validation."""
+
+    decision = classify_readiness(
+        _report_with_material_resolution(approval), "implementation"
+    )
+
+    assert decision.status is ReadinessStatus.BLOCKED
+    assert "implementation" in decision.prohibited_actions
+
+
+def test_exact_material_resolution_approval_is_accepted() -> None:
+    """Catches exact conflict decisions being blocked with fabricated resolutions."""
+    approval = ApprovalRecord(
+        "approval-resolution",
+        "resolve-conflict",
+        ("conflict-resolved-architecture",),
+        "claim-monolith",
+        "user",
+        "approval.md",
+        "2026-08-09T12:00:00Z",
+    )
+
+    decision = classify_readiness(
+        _report_with_material_resolution(approval), "implementation"
+    )
+
+    assert decision.status is ReadinessStatus.READY
+
+
 def test_redacts_likely_secrets_without_destroying_source_context() -> None:
     """Catches report serialization leaking several high-confidence secret forms."""
     private_body = "c3VwZXItc2VjcmV0LWtleS1tYXRlcmlhbA=="
@@ -298,6 +428,36 @@ def test_does_not_over_redact_identifiers_or_checksum_evidence() -> None:
 
     assert result.text == source
     assert result.findings == ()
+
+
+def test_namespaced_and_quoted_secret_assignments_are_fully_redacted() -> None:
+    """Catches credential prefixes and escaped quotes leaking secret suffix bytes."""
+    sources = {
+        "config/service.env": "SERVICE_API_KEY=service-secret-value",
+        "config/stripe.env": "STRIPE_SECRET_KEY=sk_live_exampleSecret123",
+        "config/settings.json": '{"api_key": "json-secret-value"}',
+        "config/escaped.json": '{"password": "before\\\"escaped-trailing-secret"}',
+    }
+
+    redacted = {path: redact_text(text) for path, text in sources.items()}
+    allowed_canonical_paths = exclude_secret_bearing_files(sources, ())
+
+    assert allowed_canonical_paths == ()
+    assert all(result.findings for result in redacted.values())
+    assert redacted["config/service.env"].text == "SERVICE_API_KEY=[REDACTED]"
+    assert redacted["config/stripe.env"].text == "STRIPE_SECRET_KEY=[REDACTED]"
+    assert redacted["config/settings.json"].text == '{"api_key": "[REDACTED]"}'
+    assert redacted["config/escaped.json"].text == '{"password": "[REDACTED]"}'
+    assert all(
+        secret_fragment not in result.text
+        for result in redacted.values()
+        for secret_fragment in (
+            "service-secret-value",
+            "sk_live_exampleSecret123",
+            "json-secret-value",
+            "escaped-trailing-secret",
+        )
+    )
 
 
 def test_secret_bearing_files_require_exact_secure_handling_approval() -> None:

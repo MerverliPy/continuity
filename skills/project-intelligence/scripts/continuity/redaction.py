@@ -33,10 +33,17 @@ _CONNECTION_PASSWORD_RE = re.compile(
 _BEARER_RE = re.compile(
     r"(?i)\bBearer[ \t]+(?P<secret>[A-Za-z0-9._~+/=-]{12,})"
 )
+_CREDENTIAL_NAME = (
+    r"(?:[A-Za-z][A-Za-z0-9]*[_-])*"
+    r"(?:api[_-]?key|secret[_-]?key|client[_-]?secret|access[_-]?token|"
+    r"refresh[_-]?token|password|passwd|pwd)"
+)
 _ASSIGNMENT_RE = re.compile(
-    r"(?im)(?P<label>(?<![\w])(?:api[ _-]?key|client[ _-]?secret|access[ _-]?token|"
-    r"refresh[ _-]?token|password|passwd|pwd)\s*[:=]\s*)"
-    r"(?:(?P<quote>['\"])(?P<quoted>[^'\"\r\n]+)(?P=quote)|"
+    rf"(?im)(?P<label>(?<![\w-])"
+    rf"(?:(?P<key_quote>['\"])(?P<quoted_key>{_CREDENTIAL_NAME})(?P=key_quote)|"
+    rf"(?P<bare_key>{_CREDENTIAL_NAME}))\s*[:=]\s*)"
+    r'(?:(?:"(?P<double_quoted>(?:\\.|[^"\\\r\n])*)")|'
+    r"(?:'(?P<single_quoted>(?:\\.|[^'\\\r\n])*)')|"
     r"(?P<unquoted>[^\s,;#]+))"
 )
 _PREFIXED_TOKEN_RE = re.compile(
@@ -91,10 +98,19 @@ def redact_text(text: str) -> RedactionResult:
         )
 
     for match in _ASSIGNMENT_RE.finditer(text):
-        group = "quoted" if match.group("quoted") is not None else "unquoted"
-        label = _normalize(match.group("label"))
-        kind = "api-key" if label.startswith("api key") else (
-            "password" if label.startswith(("password", "passwd", "pwd")) else "token"
+        group = next(
+            name
+            for name in ("double_quoted", "single_quoted", "unquoted")
+            if match.group(name) is not None
+        )
+        key = match.group("quoted_key") or match.group("bare_key")
+        normalized_key = _normalize(key)
+        kind = "password" if normalized_key.endswith(
+            ("password", "passwd", "pwd")
+        ) else (
+            "api-key"
+            if normalized_key.endswith(("api key", "secret key"))
+            else "token"
         )
         _append_nonoverlapping(
             findings,

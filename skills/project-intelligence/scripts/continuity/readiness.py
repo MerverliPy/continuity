@@ -39,20 +39,19 @@ _LIFECYCLE_FIELDS = frozenset(
         "status",
     }
 )
-_IMPLEMENTATION_TERMS = frozenset(
+_PRECANONICAL_ALLOWED_ACTIONS = frozenset(
     {
-        "build",
-        "code",
-        "coding",
-        "deploy",
-        "deployment",
-        "execute",
-        "execution",
-        "implement",
-        "implementation",
+        "candidate promotion preparation",
+        "conflict resolution",
+        "inspect",
+        "inspection",
+        "prepare candidate promotion",
+        "reconcile",
+        "reconciliation",
+        "resolve conflict",
         "review",
-        "test",
-        "testing",
+        "validate",
+        "validation",
     }
 )
 _APPROVED_DECISIONS = frozenset({"allow", "allowed", "approve", "approved"})
@@ -126,9 +125,27 @@ def classify_readiness(
     elif len(project_ids) > 1:
         block("project identity gate: multiple projects are selected")
 
-    # Material conflict gate: only exact, recorded reconciliation resolutions count.
-    for conflict in report.blocking_conflicts:
-        block(f"conflict gate: material conflict {conflict.conflict_id} is unresolved")
+    # Material conflict gate: independently validate every referenced resolution.
+    for conflict in report.conflicts:
+        if not conflict.material:
+            continue
+        referenced = tuple(
+            approval
+            for approval in report.approvals
+            if approval.approval_id == conflict.resolution_approval_id
+        )
+        exact_resolution = (
+            len(referenced) == 1
+            and _normalize(referenced[0].action) == "resolve conflict"
+            and referenced[0].scope == (conflict.conflict_id,)
+            and referenced[0].decision in conflict.claim_ids
+            and referenced[0].decision in selected_ids
+        )
+        if not exact_resolution:
+            block(
+                f"conflict gate: material conflict {conflict.conflict_id} lacks an "
+                "exact referenced resolution"
+            )
 
     authorized = _actions_from_claims(selected_claims, _AUTHORIZED_ACTION_FIELDS)
     prohibited = _actions_from_claims(selected_claims, _PROHIBITED_ACTION_FIELDS)
@@ -146,18 +163,20 @@ def classify_readiness(
     ):
         block(f"requested-action gate: {requested_action or '<empty>'} is not authorized")
 
-    # Lifecycle gate applies specifically to execution/implementation-stage actions.
+    # Lifecycle gate is fail-closed until a package is affirmatively canonical.
     lifecycle_values = {
         _normalize(str(claim.value))
         for claim in selected_claims
         if _normalize(claim.field) in _LIFECYCLE_FIELDS
     }
-    if _is_implementation_action(normalized_requested):
-        if lifecycle_values != {"canonical"}:
-            block(
-                "lifecycle gate: implementation requires an explicitly promoted "
-                "canonical package"
-            )
+    if (
+        lifecycle_values != {"canonical"}
+        and normalized_requested not in _PRECANONICAL_ALLOWED_ACTIONS
+    ):
+        block(
+            "lifecycle gate: non-canonical packages permit only explicit "
+            "non-mutating Continuity operations"
+        )
 
     # Evidence/condition gate: unknowns are legal only with affirmative, cited proof.
     conditions: list[str] = []
@@ -180,6 +199,8 @@ def classify_readiness(
         blocked_actions = set(prohibited)
         if requested_action:
             blocked_actions.add(requested_action)
+        else:
+            blocked_actions.add("blank or invalid requested action")
         return PreflightDecision(
             status=ReadinessStatus.BLOCKED,
             reasons=tuple(sorted(reasons)),
@@ -259,11 +280,6 @@ def _condition_json(value: object, source_ref: str) -> str | None:
         "source_ref": source_ref,
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _is_implementation_action(action: str) -> bool:
-    words = set(action.replace("-", " ").split())
-    return bool(words.intersection(_IMPLEMENTATION_TERMS))
 
 
 def _normalize(value: str) -> str:
