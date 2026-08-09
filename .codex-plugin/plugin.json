@@ -1,0 +1,6 @@
+{
+  "name": "continuity",
+  "version": "1.0.0",
+  "description": "Preservation-first project intelligence and canonical handoffs for long-running work.",
+  "skills": "./skills/"
+}
