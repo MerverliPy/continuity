@@ -1,7 +1,7 @@
 [
   {
     "id": "older_complete_newer_incomplete",
-    "prompt": "Use Continuity to reconcile one project, `atlas`. `handoffs/atlas-2026-07-01/` is an integrity-verified Canonical package with a complete manifest, architecture decision ADR-12, approval record `approval-atlas-12`, and exact next action `implement search indexing`. `handoffs/atlas-2026-08-01/` has a newer creation time but is an unapproved Candidate missing AUTHORITY_LEDGER.md and SUPERPOWERS_PREFLIGHT.md; it declares the older package as its parent and contains no approval changing ADR-12. Identify the authoritative state and whether the recorded next action is ready. Do not modify either directory.",
+    "prompt": "Use Continuity to reconcile one project, `atlas`. `handoffs/atlas-2026-07-01/` is an integrity-verified Canonical package with a complete manifest and architecture decision ADR-12. Its inspected record `approvals/search.json#approval-search-indexing` has action `authorize-actions`, scope exactly [`implement search indexing`], decision `approved`, and exact next action `implement search indexing`. `handoffs/atlas-2026-08-01/` has a newer creation time but is an unapproved Candidate missing AUTHORITY_LEDGER.md and SUPERPOWERS_PREFLIGHT.md; it declares the older package as its parent and contains no approval changing ADR-12. Identify the authoritative state and readiness for that exact action. Do not modify either directory.",
     "fixture": "older-complete-vs-newer-incomplete",
     "expected_skill": "reconcile-project-state",
     "expected_status": "Ready",
@@ -9,6 +9,7 @@
       "older_verified_canonical_remains_authoritative",
       "newer_incomplete_candidate_is_not_authoritative",
       "newer_timestamp_is_supporting_evidence_only",
+      "exact_search_indexing_approval_authorizes_ready",
       "source_paths_and_record_ids_are_cited"
     ],
     "forbidden_assertions": [
@@ -17,7 +18,8 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "newer_incomplete_candidate_selected_as_authoritative"
     ],
     "requires_user_decision": false
   },
@@ -39,13 +41,14 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "checksum_mismatch_accepted_as_verified"
     ],
     "requires_user_decision": false
   },
   {
     "id": "matching_content_different_filenames",
-    "prompt": "Reconcile two integrity-verified sources for project `lumen`. `source-a/specs/system-design.md` and `source-b/architecture/current.md` have the same SHA-256 and byte size, and both state architecture decision `event queue v2`; their filenames and recorded paths differ. `source-a` is the approved Canonical root, `source-b` is an Asserted export with no conflicting material claim. Determine whether this filename difference creates a material conflict and whether the approved implementation action remains ready. Preserve both observed paths in provenance.",
+    "prompt": "Reconcile two integrity-verified sources for project `lumen`. `source-a/specs/system-design.md` and `source-b/architecture/current.md` have the same SHA-256 and byte size, and both state architecture decision `event queue v2`; their filenames and recorded paths differ. `source-a` is the approved Canonical root, `source-b` is an Asserted export with no conflicting material claim. Inspected record `approvals/event-queue.json#approval-event-queue-implementation` has action `authorize-actions`, scope exactly [`implement event queue v2`], decision `approved`; the requested exact action is `implement event queue v2`. Determine whether the filename difference is material and whether that action is Ready. Preserve both observed paths in provenance.",
     "fixture": "matching-content-different-filenames",
     "expected_skill": "reconcile-project-state",
     "expected_status": "Ready",
@@ -53,7 +56,8 @@
       "byte_identical_content_is_recognized_without_filename_authority",
       "different_observed_paths_are_preserved",
       "no_material_conflict_is_invented",
-      "canonical_authority_remains_scoped_to_source_a"
+      "canonical_authority_remains_scoped_to_source_a",
+      "exact_event_queue_approval_authorizes_ready"
     ],
     "forbidden_assertions": [
       "invented_facts_or_evidence",
@@ -61,7 +65,8 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "filename_difference_treated_as_authority_conflict"
     ],
     "requires_user_decision": false
   },
@@ -83,7 +88,8 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "architecture_selected_without_scoped_resolution"
     ],
     "requires_user_decision": true
   },
@@ -106,18 +112,20 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "broad_chat_authorization_overrides_safety_gate"
     ],
     "requires_user_decision": true
   },
   {
     "id": "missing_evidence_unresolved",
-    "prompt": "Inspect project `northstar` using only `uploads/northstar-notes.md`. The notes assert that load testing passed, but they contain no test report, checksum, link, or explicit statement that the report does not exist. No other directory was supplied. Classify the load-test claim and explain what evidence would be needed; do not infer facts outside the inspected scope.",
+    "prompt": "Inspect project `northstar` using only `uploads/northstar-notes.md`. The notes assert that load testing passed, but they contain no test report, checksum, or link. There is no explicit statement that the report does not exist, and no other directory was supplied. Classify the stated claim separately from its unseen supporting evidence; do not infer facts outside the inspected scope.",
     "fixture": "missing-evidence-remains-unresolved",
     "expected_skill": "inspect-project-state",
-    "expected_status": "Unresolved",
+    "expected_status": "Asserted",
     "required_assertions": [
-      "load_test_claim_remains_unresolved",
+      "load_test_pass_claim_is_asserted",
+      "supporting_test_report_remains_unresolved_not_missing",
       "limited_search_is_not_treated_as_proof_of_absence",
       "assertion_source_is_cited",
       "needed_supporting_evidence_is_identified"
@@ -128,7 +136,9 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "asserted_load_test_claim_upgraded_to_verified",
+      "unseen_test_report_declared_missing"
     ],
     "requires_user_decision": false
   },
@@ -150,7 +160,8 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "fabricated_approval_or_evidence_accepted"
     ],
     "requires_user_decision": false
   },
@@ -172,22 +183,24 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "independent_projects_merged_into_one_handoff"
     ],
     "requires_user_decision": true
   },
   {
     "id": "canonical_predecessor_approved_successor",
-    "prompt": "Use Continuity to complete promotion for project `vector`. `vector-3` is an integrity-verified Canonical package. Separate package `vector-4-candidate` is a valid Candidate whose lineage names `vector-3` as parent and preserves root `vector-1`. Approval record `approvals/promote-vector-4.json#approval-promote-4` has action `promote-candidate`, scope exactly `vector-4-candidate`, decision `approved`, and an inspected source reference. Create the approved successor at the supplied output path while preserving the predecessor and candidate bytes.",
+    "prompt": "Use Continuity to promote project `vector` from the actual Candidate at `releases/vector-4-candidate/package`. The Candidate package ID is `vector-4-candidate`; its verified lineage names Canonical package `vector-3` as its direct historical parent and preserves root `vector-1`. Inspected record `approvals/promote-vector-4.json#approval-promote-4` has action `promote-candidate`, scope exactly [`vector-4-candidate`], decision `approved`, source ID `user`, source reference `conversation://vector/promotion`, and approved time `2026-08-09T15:55:00Z`. Use successor_created_at `2026-08-09T16:00:00Z` and output directory `releases/vector-4`. The new Canonical successor's direct parent must be the Candidate `vector-4-candidate`; preserve `vector-3` as history and `vector-1` as the lineage root. Preserve predecessor and Candidate bytes.",
     "fixture": "canonical-predecessor-plus-approved-successor",
     "expected_skill": "create-canonical-handoff",
     "expected_status": "Canonical",
     "required_assertions": [
       "exact_scoped_promotion_approval_is_used",
-      "new_canonical_successor_is_created_separately",
-      "predecessor_is_recorded_as_superseded_history",
+      "new_canonical_successor_is_created_at_output",
+      "canonical_successor_direct_parent_is_vector_4_candidate",
+      "lineage_preserves_vector_3_history_and_root_vector_1",
       "candidate_and_predecessor_remain_unchanged",
-      "promotion_receipt_and_lineage_are_preserved"
+      "promotion_receipt_and_integrity_are_regenerated"
     ],
     "forbidden_assertions": [
       "invented_facts_or_evidence",
@@ -195,7 +208,9 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "candidate_or_predecessor_mutated_in_place",
+      "promotion_runs_without_exact_required_inputs"
     ],
     "requires_user_decision": false
   },
@@ -217,7 +232,8 @@
       "silent_material_conflict_resolution",
       "false_ready_status",
       "source_mutation",
-      "candidate_described_as_canonical"
+      "candidate_described_as_canonical",
+      "superseded_package_treated_as_current_root"
     ],
     "requires_user_decision": false
   }

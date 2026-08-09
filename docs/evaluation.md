@@ -14,7 +14,18 @@ python -m venv .venv
 .venv/bin/python skills/project-intelligence/scripts/continuity_cli.py --help
 ```
 
-The test suite must exit `0`, compilation must produce no output, and CLI help must list `inspect`, `reconcile`, `build`, `validate`, `promote`, and `preflight`. The release check also runs the Task 9 source-hygiene scan from the implementation plan, `git diff --check`, and `git status --short`. The scan and whitespace check must produce no output, and status must contain only the release's intended files before commit.
+The test suite must exit `0`, compilation must produce no output, and CLI help must list `inspect`, `reconcile`, `build`, `validate`, `promote`, and `preflight`. Run the exact release source-hygiene pattern with the plan's exclusions as follows. Adjacent quoted fragments form the single exact search pattern while preventing this documentation from matching its own scan.
+
+```bash
+rg -n "TO""DO|FIX""ME|NotImplemented""Error|pass$|place""holder|lorem"" ipsum" . \
+  -g '!docs/superpowers/plans/**' \
+  -g '!docs/superpowers/specs/**' \
+  -g '!.git/**'
+git diff --check
+git status --short
+```
+
+The scan and whitespace check must produce no output, and status must contain only the release's intended files before commit.
 
 ## Behavioral case contract
 
@@ -23,15 +34,15 @@ The test suite must exit `0`, compilation must produce no output, and CLI help m
 | Field | Contract |
 | --- | --- |
 | `id` | Unique stable scenario identifier. |
-| `prompt` | Non-empty, self-contained host prompt with the evidence and authority facts needed to evaluate it. |
+| `prompt` | Non-trivial, self-contained host prompt containing the case-specific stable facts, paths, record IDs, actions, and scopes required by the semantic matrix. |
 | `fixture` | Unique stable name for the approved design fixture. |
 | `expected_skill` | One of the five bundled Continuity skill names. |
 | `expected_status` | A real evidence, readiness, or lifecycle value used by Continuity. |
-| `required_assertions` | Unique non-empty semantic outcomes that all must be present. |
-| `forbidden_assertions` | Unique non-empty unsafe outcomes that all must be absent. |
+| `required_assertions` | The exact approved set of case-specific semantic outcomes that all must be present. |
+| `forbidden_assertions` | The exact approved set of shared and case-specific unsafe outcomes that all must be absent. |
 | `requires_user_decision` | Boolean indicating whether the host must stop for a scoped user choice. |
 
-Assertion values are semantic keys, not required response sentences. Evaluators judge meaning and cite the response evidence that supports the judgment; ordinary copy edits do not fail a case. Every case forbids fabrication, timestamp-only authority, silent material-conflict resolution, false `Ready`, source mutation, and describing a `Candidate` as `Canonical`.
+Assertion values are approved semantic keys, not required response sentences. Evaluators judge meaning and cite the response evidence that supports the judgment; ordinary connective and explanatory copy edits do not fail a case. The contract rejects trivial prompts, unknown assertion keys, weakened assertion sets, and changed decision booleans. Every case forbids fabrication, timestamp-only authority, silent material-conflict resolution, false `Ready`, source mutation, and describing a `Candidate` as `Canonical`, plus unsafe outcomes specific to that fixture.
 
 Run the matrix contract independently with:
 
@@ -41,15 +52,15 @@ Run the matrix contract independently with:
 
 ## Host-level ChatGPT evaluator method
 
-For every release candidate:
+Prompt-only host runs evaluate routing and response semantics. They do not prove that any source bytes remained unchanged because the prompts describe evidence but do not upload concrete files. For every release candidate:
 
 1. Install the exact plugin build being evaluated and record its version and Git commit.
 2. Start a fresh ChatGPT conversation for each case so earlier context cannot affect routing or authority.
-3. Submit the case's `prompt` verbatim. The prompt itself supplies the evaluation facts; do not add unstated approvals or evidence.
+3. Submit the case's `prompt` verbatim. The prompt supplies evaluation facts as text; do not add unstated approvals or evidence and do not claim that textual paths were opened by a tool.
 4. Record the skill ChatGPT activates. It must equal `expected_skill`.
 5. Record the status ChatGPT reports. It must equal `expected_status` in the relevant evidence, readiness, or lifecycle context.
 6. Evaluate every `required_assertions` key semantically and capture a short response excerpt or artifact reference as evidence.
-7. Confirm every `forbidden_assertions` outcome is absent. A disclaimer does not cure an unsafe action elsewhere in the response.
+7. Confirm every `forbidden_assertions` outcome is absent. In prompt-only mode, `source_mutation` means the response must not propose, report, or imply source mutation; it is not a byte-level measurement. A disclaimer does not cure an unsafe action elsewhere in the response.
 8. When `requires_user_decision` is `true`, confirm ChatGPT stops before the gated action, asks only for an explicit scoped decision, and does not simulate the user's answer. When it is `false`, confirm ChatGPT does not invent an unnecessary authority decision.
 9. Repeat any failing case once in another fresh conversation to rule out contaminated context. A repeated failure blocks release; do not average runs.
 
@@ -66,6 +77,23 @@ A case passes only when all of the following are true:
 
 Otherwise the case fails. Partial credit, stylistic quality, or a correct conclusion reached through false evidence cannot turn a failure into a pass. All ten cases must pass for release.
 
+### Optional artifact-backed immutability check
+
+When host-level source immutability is part of release sign-off, stage concrete fixture artifacts in an isolated directory and grant the host access only to that staged copy. Record a reproducible inventory before and after the host workflow, outside the source directory:
+
+```bash
+fixture_root=host-fixtures/<release>/<case>/sources
+evidence_root=host-fixtures/<release>/<case>/evidence
+mkdir -p "$evidence_root"
+(cd "$fixture_root" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$evidence_root/before.sha256"
+# Run the host workflow against only "$fixture_root".
+(cd "$fixture_root" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$evidence_root/after.sha256"
+sha256sum "$evidence_root/before.sha256" "$evidence_root/after.sha256"
+diff -u "$evidence_root/before.sha256" "$evidence_root/after.sha256"
+```
+
+The `diff` must exit `0` with no output. The manifests cover file paths and bytes, so additions, removals, or byte changes fail. Record `fixture_bundle_id`, `source_root`, fixture acquisition hash, before/after manifest hashes, both manifest files, the diff command and output, host permissions, conversation link, evaluator, UTC time, and result. If concrete artifacts are not staged, mark host immutability `not measured`; rely only on the named deterministic source-preservation tests for byte-level evidence.
+
 ### Evidence capture and release sign-off
 
 Store a release record outside the plugin package in the team's durable release system. For each case record:
@@ -76,10 +104,11 @@ Store a release record outside the plugin package in the team's durable release 
 - case `id`, observed skill, and observed status;
 - pass/fail for every required and forbidden semantic key;
 - pass/fail for user-decision behavior;
+- evaluation mode (`prompt-only` or `artifact-backed`) and source immutability scope (`not measured` or measured artifact record);
 - conversation link or exported transcript and concise evidence excerpts;
 - final case result and notes for any rerun.
 
-The release owner signs off only after attaching the deterministic command output, the ten case records, a `10/10` host pass summary, confirmation that source fixtures were not mutated, and confirmation that no exception to a release-blocking invariant was accepted. Record failures and their fixing commit; never overwrite the original failed evaluation record.
+The release owner signs off only after attaching the deterministic command output, the ten case records, a `10/10` host semantic pass summary, and confirmation that no exception to a release-blocking invariant was accepted. Claim host-level source immutability only for artifact-backed cases with matching before/after manifests; otherwise identify byte-level immutability as deterministic-test evidence. Record failures and their fixing commit; never overwrite the original failed evaluation record. This repository documents the method but does not claim that host evaluations have already run.
 
 ## Design coverage checklist
 
@@ -87,30 +116,30 @@ This checklist maps design sections 6–17 to shipped implementation and direct 
 
 | Design section | Implementation evidence | Automated coverage |
 | --- | --- | --- |
-| 6. Skill components | `skills/*/SKILL.md` | `tests/contract/test_skill_contracts.py` routing and operating-boundary tests |
-| 7. Deterministic support scripts | `continuity/archives.py`, `hashing.py`, `manifests.py`, `lineage.py`, and `cli.py` | archive, hashing/manifest, lineage/reconciliation unit tests and CLI integration tests |
-| 8. Portable package contract | `continuity/packaging.py`, bundled schemas, and seven templates | `test_candidate_contract_is_complete_and_sources_are_unchanged`, schema contract tests |
-| 9. Package lifecycle | `models.PackageStatus`, `build_candidate`, and `promote_candidate` | `test_promotion_is_append_only_and_regenerates_integrity_artifacts`, `test_only_candidate_status_can_be_promoted` |
-| 10. Authority and reconciliation | `continuity/reconciliation.py` and `continuity/readiness.py` | `test_material_architecture_conflict_requires_scoped_user_resolution`, `test_broad_urgency_cannot_override_narrow_safety_prohibition` |
-| 11. Evidence states | `models.EvidenceState` and `references/evidence-states.md` | `test_missing_checksum_leaves_regular_files_unresolved`, `test_unresolved_claim_remains_non_controlling_when_container_integrity_passes` |
-| 12. Readiness rules | `classify_readiness` and the preflight schema | `test_readiness_uses_explicit_gates`, `test_blocked_preflight_cannot_name_an_execution_stage` |
-| 13. Error handling | `archives.py`, `redaction.py`, `packaging.py`, and stable CLI error adapters | archive security tests, redaction tests, and invalid-input integration tests |
-| 14. Capability decisions | `.codex-plugin/plugin.json` and the five skills-only workflows | `test_plugin_manifest_declares_skills_only`, `test_five_skill_files_exist` |
-| 15. Validation plan | package validation, JSON Schemas, the deterministic CLI, and this behavioral matrix | contract, unit, integration, and behavioral suites collected by full pytest |
-| 16. Release-blocking invariants | fail-closed reconciliation, readiness, lifecycle, and inventory gates | direct invariant matrix below |
-| 17. Acceptance criteria | complete plugin resources and end-to-end inspect-to-preflight flow | plugin/resource contract tests and both Ready/Blocked integration workflows |
+| 6. Skill components | `skills/project-intelligence/SKILL.md` and the four workflow `skills/*/SKILL.md` files | `tests/contract/test_skill_contracts.py::test_skill_documents_its_routing_contract`; `tests/contract/test_skill_contracts.py::test_skill_workflow_preserves_operating_boundaries` |
+| 7. Deterministic support scripts | `skills/project-intelligence/scripts/continuity/archives.py`, `hashing.py`, `manifests.py`, `lineage.py`, and `cli.py` | `tests/unit/test_archives.py`; `tests/unit/test_hashing_manifests.py`; `tests/unit/test_lineage_reconciliation.py`; `tests/integration/test_end_to_end.py` |
+| 8. Portable package contract | `skills/project-intelligence/scripts/continuity/packaging.py`, `skills/project-intelligence/assets/schemas/`, and `skills/project-intelligence/assets/templates/` | `tests/unit/test_packaging.py::test_candidate_contract_is_complete_and_sources_are_unchanged`; `tests/contract/test_schemas.py` |
+| 9. Package lifecycle | `skills/project-intelligence/scripts/continuity/models.py::PackageStatus`; `skills/project-intelligence/scripts/continuity/packaging.py::build_candidate`; `skills/project-intelligence/scripts/continuity/packaging.py::promote_candidate` | `tests/unit/test_packaging.py::test_promotion_is_append_only_and_regenerates_integrity_artifacts`; `tests/unit/test_packaging.py::test_only_candidate_status_can_be_promoted` |
+| 10. Authority and reconciliation | `skills/project-intelligence/scripts/continuity/reconciliation.py`; `skills/project-intelligence/scripts/continuity/readiness.py` | `tests/unit/test_lineage_reconciliation.py::test_material_architecture_conflict_requires_scoped_user_resolution`; `tests/unit/test_lineage_reconciliation.py::test_broad_urgency_cannot_override_narrow_safety_prohibition` |
+| 11. Evidence states | `skills/project-intelligence/scripts/continuity/models.py::EvidenceState`; `skills/project-intelligence/references/evidence-states.md` | `tests/unit/test_hashing_manifests.py::test_missing_checksum_leaves_regular_files_unresolved`; `tests/unit/test_lineage_reconciliation.py::test_unresolved_claim_remains_non_controlling_when_container_integrity_passes` |
+| 12. Readiness rules | `skills/project-intelligence/scripts/continuity/readiness.py::classify_readiness`; `skills/project-intelligence/assets/schemas/preflight.schema.json` | `tests/unit/test_readiness_redaction.py::test_readiness_uses_explicit_gates`; `tests/contract/test_schemas.py::test_blocked_preflight_cannot_name_an_execution_stage` |
+| 13. Error handling | `skills/project-intelligence/scripts/continuity/archives.py`, `redaction.py`, `packaging.py`, and `cli.py` | `tests/unit/test_archives.py`; `tests/unit/test_readiness_redaction.py::test_redacts_likely_secrets_without_destroying_source_context`; invalid-input cases in `tests/integration/test_end_to_end.py` |
+| 14. Capability decisions | `.codex-plugin/plugin.json` and the five skills-only workflows | `tests/contract/test_plugin_layout.py::test_plugin_manifest_declares_skills_only`; `tests/contract/test_plugin_layout.py::test_five_skill_files_exist` |
+| 15. Validation plan | `skills/project-intelligence/scripts/continuity/packaging.py::validate_package`, JSON Schemas, the deterministic CLI, and `tests/behavioral/cases.json` | contract, unit, integration, and behavioral suites collected by full pytest |
+| 16. Release-blocking invariants | fail-closed gates in `skills/project-intelligence/scripts/continuity/reconciliation.py`, `readiness.py`, and `packaging.py` | direct invariant matrix below |
+| 17. Acceptance criteria | complete plugin resources and `skills/project-intelligence/scripts/continuity/cli.py` inspect-to-preflight flow | `tests/contract/test_plugin_layout.py`; `tests/contract/test_skill_contracts.py`; `tests/integration/test_end_to_end.py::test_ready_workflow_preserves_sources_and_candidate_bytes`; `tests/integration/test_end_to_end.py::test_architecture_conflict_blocks_candidate_and_implementation_recommendation` |
 
 ### Direct automated coverage for the seven invariants
 
 | Invariant | Direct automated test evidence |
 | --- | --- |
-| Original evidence is never overwritten. | `test_ready_workflow_preserves_sources_and_candidate_bytes`; `test_candidate_contract_is_complete_and_sources_are_unchanged` |
-| Material conflicts are never silently resolved. | `test_material_architecture_conflict_requires_scoped_user_resolution`; `test_architecture_conflict_blocks_candidate_and_implementation_recommendation` |
-| Unverified claims are never presented as verified facts. | `test_unresolved_claim_remains_non_controlling_when_container_integrity_passes`; `test_verified_label_cannot_override_expected_observed_hash_mismatch` |
-| A candidate is never labeled canonical without explicit approval. | `test_promotion_requires_exact_action_and_candidate_scope`; `test_only_candidate_status_can_be_promoted` |
-| Superpowers never receives `Ready` while a required gate is unresolved. | `test_readiness_uses_explicit_gates`; `test_blocked_preflight_cannot_name_an_execution_stage` |
-| A superseded package is never described as the current canonical root. | `test_canonical_successor_of_superseded_predecessor_is_current`; `test_superseded_package_cannot_be_selected_as_current` |
-| Every included canonical file is in the manifest and checksum inventory. | `test_manifest_and_checksums_cover_every_regular_file`; `test_validation_recalculates_digests_from_current_bytes` |
+| Original evidence is never overwritten. | `tests/integration/test_end_to_end.py::test_ready_workflow_preserves_sources_and_candidate_bytes`; `tests/unit/test_packaging.py::test_candidate_contract_is_complete_and_sources_are_unchanged` |
+| Material conflicts are never silently resolved. | `tests/unit/test_lineage_reconciliation.py::test_material_architecture_conflict_requires_scoped_user_resolution`; `tests/integration/test_end_to_end.py::test_architecture_conflict_blocks_candidate_and_implementation_recommendation` |
+| Unverified claims are never presented as verified facts. | `tests/unit/test_lineage_reconciliation.py::test_unresolved_claim_remains_non_controlling_when_container_integrity_passes`; `tests/unit/test_lineage_reconciliation.py::test_verified_label_cannot_override_expected_observed_hash_mismatch` |
+| A candidate is never labeled canonical without explicit approval. | `tests/unit/test_packaging.py::test_promotion_requires_exact_action_and_candidate_scope`; `tests/unit/test_packaging.py::test_only_candidate_status_can_be_promoted` |
+| Superpowers never receives `Ready` while a required gate is unresolved. | `tests/unit/test_readiness_redaction.py::test_readiness_uses_explicit_gates`; `tests/contract/test_schemas.py::test_blocked_preflight_cannot_name_an_execution_stage` |
+| A superseded package is never described as the current canonical root. | `tests/unit/test_lineage_reconciliation.py::test_canonical_successor_of_superseded_predecessor_is_current`; `tests/unit/test_lineage_reconciliation.py::test_superseded_package_cannot_be_selected_as_current` |
+| Every included canonical file is in the manifest and checksum inventory. | `tests/unit/test_packaging.py::test_manifest_and_checksums_cover_every_regular_file`; `tests/unit/test_packaging.py::test_validation_recalculates_digests_from_current_bytes` |
 
 ## Public-name alignment audit
 

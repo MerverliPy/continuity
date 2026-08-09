@@ -61,7 +61,9 @@ Start with `project-intelligence` unless the selected project and required downs
 
 ## Deterministic CLI
 
-All commands emit stable JSON to the requested output. Exit code `0` means the operation completed and its gate passed, `2` means a valid result is blocked, and `1` means invalid input or an operational failure. Output paths must be separate from inspected sources.
+Every command emits stable result JSON to standard output. `inspect`, `reconcile`, `validate`, and `preflight` also atomically write the same JSON to their required `--output` file. `build --output-dir` and `promote --output` use those paths for atomic release directories; their result JSON is written only to standard output.
+
+Exit code `0` means the command completed, not that every evidence or safety field passed. In particular, `inspect` can complete with `integrity.evidence_state` equal to `Contradicted` or `archive.safe` equal to `false`. Exit code `2` represents a valid blocked result from reconciliation, build, validation of a blocked package, or preflight. Exit code `1` represents invalid input, failed validation, or an operational failure. Operators must inspect the structured result: `integrity` and `archive` for inspection, `report.blocking_conflict_ids` for reconciliation, `package.status` for build, `validation.valid`/`status`/`readiness` for validation, and `status` plus authority fields for preflight. Output paths must remain separate from read-only inputs.
 
 Set a short shell variable for readability:
 
@@ -173,7 +175,8 @@ Continuity remains fully useful when Superpowers is absent: it still returns ins
 - Every material claim carries an evidence state and source reference. A limited search yields `Unresolved`, not proof that an artifact is `Missing`.
 - Material architecture, behavior, scope, authority, safety, readiness, or next-action conflicts require exact user resolution.
 - Broad urgency or administrative language cannot override a narrower recorded prohibition.
-- Likely secrets are redacted from reports and excluded from packages unless exact path-scoped secure-handling approval is supplied.
+- Reconciliation preserves claim values unchanged; it does not automatically redact secrets from input JSON, reports, output files, or standard output. Operators must restrict access to those inputs and results and avoid placing secrets in claims.
+- During canonical packaging, text sources are scanned for likely secrets. Publication fails unless every detected secret-bearing canonical destination has exact path-scoped `secure-handling` approval. With that approval, the source bytes are included unchanged rather than redacted, so the release itself must receive approved secure handling.
 - Candidate and canonical publication uses one atomic, no-clobber outer release boundary. Every canonical file is covered by the manifest and checksum inventory.
 - User-supplied narrative is supplemental and cannot create governing claims, approvals, conflict resolutions, or readiness authority.
 
