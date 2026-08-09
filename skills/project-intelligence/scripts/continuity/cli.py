@@ -236,16 +236,13 @@ def _inspect_directory(source: Path, source_id: str) -> _CommandResult:
 
 def _inspect_archive(source: Path, source_id: str) -> _CommandResult:
     inspection = inspect_zip(source)
-    paths = {entry.normalized_path for entry in inspection.entries}
-    manifest_present = "MANIFEST.json" in paths
-    checksum_present = "SHA256SUMS.txt" in paths
     categories: tuple[str, ...]
     if not inspection.safe:
         state = EvidenceState.CONTRADICTED
         code = "archive-safety-failed"
         categories = _validation_categories(inspection.violations)
         violation_count = len(inspection.violations)
-    elif manifest_present and checksum_present:
+    else:
         with tempfile.TemporaryDirectory(prefix="continuity-inspect-") as temporary:
             extracted = Path(temporary) / "package"
             extracted_inspection = safe_extract_zip(source, extracted)
@@ -255,22 +252,26 @@ def _inspect_archive(source: Path, source_id: str) -> _CommandResult:
                 categories = _validation_categories(extracted_inspection.violations)
                 violation_count = len(extracted_inspection.violations)
             else:
-                validation = validate_package(_package_root(extracted))
-                if validation.valid:
-                    state = EvidenceState.VERIFIED
-                    code = "package-verified"
-                    categories = ()
-                    violation_count = 0
+                package_root = _package_root(extracted)
+                manifest_present = _regular_file(package_root / "MANIFEST.json")
+                checksum_present = _regular_file(package_root / "SHA256SUMS.txt")
+                if manifest_present and checksum_present:
+                    validation = validate_package(package_root)
+                    if validation.valid:
+                        state = EvidenceState.VERIFIED
+                        code = "package-verified"
+                        categories = ()
+                        violation_count = 0
+                    else:
+                        state = EvidenceState.CONTRADICTED
+                        code = "package-validation-failed"
+                        categories = _validation_categories(validation.violations)
+                        violation_count = len(validation.violations)
                 else:
-                    state = EvidenceState.CONTRADICTED
-                    code = "package-validation-failed"
-                    categories = _validation_categories(validation.violations)
-                    violation_count = len(validation.violations)
-    else:
-        state = EvidenceState.UNRESOLVED
-        code = "package-integrity-evidence-incomplete"
-        categories = ("missing-package-integrity",)
-        violation_count = 1
+                    state = EvidenceState.UNRESOLVED
+                    code = "package-integrity-evidence-incomplete"
+                    categories = ("missing-package-integrity",)
+                    violation_count = 1
     integrity = IntegrityFinding(
         finding_id=_finding_id(source_id),
         source_id=source_id,
@@ -750,10 +751,22 @@ def _validated_json_output(namespace: argparse.Namespace) -> Path | None:
 def _validate_build_output(output: Path, canonical_sources: Sequence[Path]) -> None:
     _validate_write_destination(output)
     output_path = _resolved_path(output)
+    resolved_sources: list[Path] = []
     for source in canonical_sources:
+        if _has_symlink_component(source):
+            raise CliInputError("canonical source path may not traverse a symlink")
         source_path = _resolved_path(source)
+        resolved_sources.append(source_path)
         if _paths_overlap(output_path, source_path):
             raise CliInputError("release output overlaps canonical source evidence")
+    if not resolved_sources:
+        return
+    common_text = os.path.commonpath([str(source.parent) for source in resolved_sources])
+    common_root = Path(common_text)
+    if common_root == Path(common_root.anchor):
+        raise CliInputError("canonical sources do not identify one project root")
+    if output_path == common_root or _is_within(output_path, common_root):
+        raise CliInputError("release output overlaps canonical source tree")
 
 
 def _validate_promotion_output(output: Path, candidate: Path, package_root: Path) -> None:
@@ -767,7 +780,14 @@ def _validate_promotion_output(output: Path, candidate: Path, package_root: Path
 
 
 def _validate_write_destination(output: Path) -> None:
-    absolute = Path(os.path.abspath(output))
+    if _has_symlink_component(output):
+        raise CliInputError("output path may not traverse a symlink")
+    if not output.parent.is_dir():
+        raise CliInputError("output parent does not exist")
+
+
+def _has_symlink_component(path: Path) -> bool:
+    absolute = Path(os.path.abspath(path))
     current = Path(absolute.anchor)
     for component in absolute.parts[1:]:
         current /= component
@@ -776,9 +796,8 @@ def _validate_write_destination(output: Path) -> None:
         except FileNotFoundError:
             continue
         if stat.S_ISLNK(mode):
-            raise CliInputError("output path may not traverse a symlink")
-    if not output.parent.is_dir():
-        raise CliInputError("output parent does not exist")
+            return True
+    return False
 
 
 def _resolved_path(path: Path) -> Path:

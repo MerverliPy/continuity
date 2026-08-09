@@ -117,6 +117,39 @@ def _approval(
     }
 
 
+def _minimal_build_request(canonical_files: dict[str, str]) -> dict[str, object]:
+    return {
+        "package_id": "overlap",
+        "project_id": "alpha",
+        "created_at": "2026-08-09T12:30:00Z",
+        "selected_source_hashes": {"source": "a" * 64},
+        "reconciliation_report": {
+            "claims": [],
+            "conflicts": [],
+            "findings": [],
+            "approvals": [],
+            "selected_claim_ids": [],
+            "blocking_conflict_ids": [],
+            "notes": [],
+        },
+        "canonical_files": canonical_files,
+        "rendered_documents": {path: "state\n" for path in DOCUMENT_PATHS},
+        "lineage_data": {},
+        "evidence_index": {},
+        "secure_handling_approvals": [],
+        "readiness": "Ready",
+        "allow_conditional_promotion": False,
+    }
+
+
+def _wrap_zip(source: Path, destination: Path) -> None:
+    with zipfile.ZipFile(source, "r") as input_archive, zipfile.ZipFile(
+        destination, "w"
+    ) as output_archive:
+        for info in input_archive.infolist():
+            output_archive.writestr(f"package/{info.filename}", input_archive.read(info))
+
+
 def test_ready_workflow_preserves_sources_and_candidate_bytes(
     tmp_path: Path, repo_root: Path
 ) -> None:
@@ -330,6 +363,18 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     )
     assert canonical_inspection["integrity"]["evidence_state"] == "Verified"
     assert canonical_inspection["archive"]["code"] == "package-verified"
+    wrapped_canonical = tmp_path / "wrapped-canonical.zip"
+    _wrap_zip(canonical_release / f"{canonical_id}.zip", wrapped_canonical)
+    wrapped_inspection, _ = _run(
+        wrapper,
+        "inspect",
+        wrapped_canonical,
+        "--output",
+        tmp_path / "wrapped-canonical.json",
+        expected=0,
+    )
+    assert wrapped_inspection["integrity"]["evidence_state"] == "Verified"
+    assert wrapped_inspection["archive"]["code"] == "package-verified"
 
     preflight_input = _json_file(
         tmp_path / "preflight-input.json", reconciliation["report"]
@@ -617,23 +662,7 @@ def test_build_output_may_not_contain_a_canonical_source(
     before = source.read_bytes()
     request = _json_file(
         tmp_path / "overlap-build.json",
-        {
-            "package_id": "overlap",
-            "project_id": "alpha",
-            "created_at": "2026-08-09T12:30:00Z",
-            "selected_source_hashes": {"source": "a" * 64},
-            "reconciliation_report": {
-                "claims": [], "conflicts": [], "findings": [], "approvals": [],
-                "selected_claim_ids": [], "blocking_conflict_ids": [], "notes": [],
-            },
-            "canonical_files": {"app.py": str(source)},
-            "rendered_documents": {path: "state\n" for path in DOCUMENT_PATHS},
-            "lineage_data": {},
-            "evidence_index": {},
-            "secure_handling_approvals": [],
-            "readiness": "Ready",
-            "allow_conditional_promotion": False,
-        },
+        _minimal_build_request({"app.py": str(source)}),
     )
 
     payload, _ = _run(
@@ -648,6 +677,161 @@ def test_build_output_may_not_contain_a_canonical_source(
 
     assert payload["error"]["code"] == "invalid_input"
     assert source.read_bytes() == before
+
+
+def test_build_output_may_not_be_beneath_single_source_tree(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches a nonexistent release directory being created beside a source file."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "app.py"
+    source.write_text("preserve = True\n", encoding="utf-8")
+    before = _snapshot(source_root)
+    request = _json_file(
+        tmp_path / "single-source.json",
+        _minimal_build_request({"app.py": str(source)}),
+    )
+    release = source_root / "release"
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        release,
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert payload["error"]["message"] == "release output overlaps canonical source tree"
+    assert not release.exists()
+    assert _snapshot(source_root) == before
+
+
+def test_build_derives_common_root_for_multiple_nested_sources(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches per-file overlap checks missing their shared project boundary."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source_root = tmp_path / "project"
+    first = source_root / "src/app.py"
+    second = source_root / "config/settings.json"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_text("preserve = True\n", encoding="utf-8")
+    second.write_text("{}\n", encoding="utf-8")
+    before = _snapshot(source_root)
+    request = _json_file(
+        tmp_path / "nested-sources.json",
+        _minimal_build_request({"src/app.py": str(first), "config/settings.json": str(second)}),
+    )
+    release = source_root / "release"
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        release,
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert payload["error"]["message"] == "release output overlaps canonical source tree"
+    assert not release.exists()
+    assert _snapshot(source_root) == before
+
+
+def test_build_rejects_canonical_source_through_symlink_parent(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches aliases obscuring the source-tree boundary used for release checks."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "app.py"
+    source.write_text("preserve = True\n", encoding="utf-8")
+    alias = tmp_path / "source-alias"
+    alias.symlink_to(source_root, target_is_directory=True)
+    request = _json_file(
+        tmp_path / "aliased-source.json",
+        _minimal_build_request({"app.py": str(alias / "app.py")}),
+    )
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        tmp_path / "legitimate-sibling",
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert payload["error"]["message"] == "canonical source path may not traverse a symlink"
+    assert not (tmp_path / "legitimate-sibling").exists()
+
+
+def test_build_rejects_sources_with_only_filesystem_root_in_common(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches multiple-project evidence being treated as one writable project tree."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    local_source = tmp_path / "local.py"
+    local_source.write_text("preserve = True\n", encoding="utf-8")
+    remote_source = repo_root / "README.md"
+    request = _json_file(
+        tmp_path / "multiple-roots.json",
+        _minimal_build_request(
+            {"local.py": str(local_source), "documentation/README.md": str(remote_source)}
+        ),
+    )
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        tmp_path / "release",
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert payload["error"]["message"] == "canonical sources do not identify one project root"
+    assert not (tmp_path / "release").exists()
+
+
+def test_build_allows_sibling_release_outside_source_root(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches source-boundary validation rejecting a legitimate sibling destination."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "app.py"
+    source.write_text("preserve = True\n", encoding="utf-8")
+    request = _json_file(
+        tmp_path / "sibling-output.json",
+        _minimal_build_request({"app.py": str(source)}),
+    )
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        tmp_path / "release",
+        expected=1,
+    )
+
+    assert payload["error"]["message"] != "release output overlaps canonical source evidence"
 
 
 def test_promotion_output_may_not_be_inside_candidate_release(
@@ -699,6 +883,19 @@ def test_zip_inspection_requires_verified_package_bytes(
     assert payload["archive"]["code"] == "package-validation-failed"
     assert "MANIFEST.json" not in json.dumps(payload)
 
+    wrapped = tmp_path / "wrapped-fabricated.zip"
+    _wrap_zip(archive, wrapped)
+    wrapped_payload, _ = _run(
+        wrapper,
+        "inspect",
+        wrapped,
+        "--output",
+        tmp_path / "wrapped-inspect.json",
+        expected=0,
+    )
+    assert wrapped_payload["integrity"]["evidence_state"] == "Contradicted"
+    assert wrapped_payload["archive"]["code"] == "package-validation-failed"
+
 
 def test_safe_non_package_zip_remains_unresolved(
     tmp_path: Path, repo_root: Path
@@ -725,9 +922,9 @@ def test_malformed_checksum_and_secret_member_are_sanitized(
     secret = "submitted-secret-filename"
     archive = tmp_path / "malformed.zip"
     with zipfile.ZipFile(archive, "w") as output:
-        output.writestr("MANIFEST.json", "{}\n")
-        output.writestr("SHA256SUMS.txt", "malformed checksum\n")
-        output.writestr(f"canonical/{secret}.txt", "secret-value")
+        output.writestr("package/MANIFEST.json", "{}\n")
+        output.writestr("package/SHA256SUMS.txt", "malformed checksum\n")
+        output.writestr(f"package/canonical/{secret}.txt", "secret-value")
 
     payload, completed = _run(
         wrapper, "inspect", archive, "--output", tmp_path / "result.json", expected=0
