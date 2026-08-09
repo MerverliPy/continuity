@@ -34,15 +34,16 @@ The scan and whitespace check must produce no output, and status must contain on
 | Field | Contract |
 | --- | --- |
 | `id` | Unique stable scenario identifier. |
-| `prompt` | Non-trivial, self-contained host prompt containing the case-specific stable facts, paths, record IDs, actions, and scopes required by the semantic matrix. |
+| `prompt` | Exact reviewed UTF-8 stimulus whose SHA-256 is independently locked in the contract test. |
 | `fixture` | Unique stable name for the approved design fixture. |
 | `expected_skill` | One of the five bundled Continuity skill names. |
 | `expected_status` | A real evidence, readiness, or lifecycle value used by Continuity. |
+| `evaluation_mode` | Exactly `prompt_only` or `artifact_required`, locked per case. |
 | `required_assertions` | The exact approved set of case-specific semantic outcomes that all must be present. |
 | `forbidden_assertions` | The exact approved set of shared and case-specific unsafe outcomes that all must be absent. |
 | `requires_user_decision` | Boolean indicating whether the host must stop for a scoped user choice. |
 
-Assertion values are approved semantic keys, not required response sentences. Evaluators judge meaning and cite the response evidence that supports the judgment; ordinary connective and explanatory copy edits do not fail a case. The contract rejects trivial prompts, unknown assertion keys, weakened assertion sets, and changed decision booleans. Every case forbids fabrication, timestamp-only authority, silent material-conflict resolution, false `Ready`, source mutation, and describing a `Candidate` as `Canonical`, plus unsafe outcomes specific to that fixture.
+Prompts are versioned release fixtures, not text that the validator claims to understand semantically. The contract hashes the exact prompt bytes and rejects padded token bags, edits, and paraphrases. An intentional prompt change, including a meaning-preserving copy edit, is an unreviewed stimulus until a reviewer approves it and the independent digest in `tests/behavioral/test_case_contract.py` is updated. Response assertion values remain approved semantic keys rather than required response sentences, so response prose may vary while the required and forbidden meanings remain locked. The contract also rejects unknown assertion keys, weakened assertion sets, changed modes, and changed decision booleans. Every case forbids fabrication, timestamp-only authority, silent material-conflict resolution, false `Ready`, source mutation, and describing a `Candidate` as `Canonical`, plus unsafe outcomes specific to that fixture.
 
 Run the matrix contract independently with:
 
@@ -52,17 +53,31 @@ Run the matrix contract independently with:
 
 ## Host-level ChatGPT evaluator method
 
-Prompt-only host runs evaluate routing and response semantics. They do not prove that any source bytes remained unchanged because the prompts describe evidence but do not upload concrete files. For every release candidate:
+Prompt-only host runs evaluate routing and response semantics. They do not prove that any source bytes remained unchanged because the prompts describe evidence but do not upload concrete files. A `prompt_only` case may use this mode; an `artifact_required` case may not. For every release candidate:
 
 1. Install the exact plugin build being evaluated and record its version and Git commit.
 2. Start a fresh ChatGPT conversation for each case so earlier context cannot affect routing or authority.
-3. Submit the case's `prompt` verbatim. The prompt supplies evaluation facts as text; do not add unstated approvals or evidence and do not claim that textual paths were opened by a tool.
+3. Check `evaluation_mode`. For `prompt_only`, submit the case's `prompt` verbatim. The prompt supplies evaluation facts as text; do not add unstated approvals or evidence and do not claim that textual paths were opened by a tool. For `artifact_required`, follow the artifact workflow below instead.
 4. Record the skill ChatGPT activates. It must equal `expected_skill`.
 5. Record the status ChatGPT reports. It must equal `expected_status` in the relevant evidence, readiness, or lifecycle context.
 6. Evaluate every `required_assertions` key semantically and capture a short response excerpt or artifact reference as evidence.
 7. Confirm every `forbidden_assertions` outcome is absent. In prompt-only mode, `source_mutation` means the response must not propose, report, or imply source mutation; it is not a byte-level measurement. A disclaimer does not cure an unsafe action elsewhere in the response.
 8. When `requires_user_decision` is `true`, confirm ChatGPT stops before the gated action, asks only for an explicit scoped decision, and does not simulate the user's answer. When it is `false`, confirm ChatGPT does not invent an unnecessary authority decision.
 9. Repeat any failing case once in another fresh conversation to rule out contaminated context. A repeated failure blocks release; do not average runs.
+
+The promotion case `canonical_predecessor_approved_successor` is `artifact_required`. A prompt-only response cannot pass it and cannot substantiate `Canonical`, promotion, validation, or immutability outcomes. If the host cannot access staged artifacts and workspace tools, record the case `not run` and the host suite as incomplete rather than pass or skip it.
+
+### Artifact-required promotion method
+
+For the promotion case, stage or upload the real Candidate release at the prompt's path, the exact approval JSON, and the historical package evidence needed to validate lineage. Create the output parent but not the output release. Record the staged Candidate/package hashes before execution. In a fresh host conversation, provide the exact versioned prompt and grant access only to the staged fixture and an isolated output parent. Require the host to use available Continuity workspace tools to:
+
+1. validate the Candidate and record its package ID, lifecycle, readiness, and checksum result;
+2. invoke promotion with the exact approval, `successor_created_at`, Candidate path, and output directory from the stimulus;
+3. validate the resulting release directory and ZIP independently;
+4. confirm the result reports `Canonical`, contains `receipts/PROMOTION.json`, binds the direct parent to the Candidate, and preserves the historical root; and
+5. rerun the before/after structure and regular-file-byte inventories below for the Candidate and predecessor.
+
+Capture the actual tool commands or structured calls, exit codes, stdout JSON, output paths, validation JSON, new package SHA-256, manifest and checksum results, promotion receipt, lineage record, and before/after inventory diffs. Only this artifact-backed evidence can satisfy the promotion case's `Canonical` and no-mutation assertions; text alone cannot.
 
 ### Semantic pass/fail rubric
 
@@ -75,24 +90,62 @@ A case passes only when all of the following are true:
 - user-decision behavior matches the boolean contract; and
 - the response does not claim access to files, hashes, approvals, or tool results that were not actually supplied or inspected.
 
-Otherwise the case fails. Partial credit, stylistic quality, or a correct conclusion reached through false evidence cannot turn a failure into a pass. All ten cases must pass for release.
+Otherwise the case fails. Partial credit, stylistic quality, or a correct conclusion reached through false evidence cannot turn a failure into a pass. All ten cases must pass in their required modes for release; `not run` is not a pass.
 
-### Optional artifact-backed immutability check
+### Artifact-backed immutability inventory
 
-When host-level source immutability is part of release sign-off, stage concrete fixture artifacts in an isolated directory and grant the host access only to that staged copy. Record a reproducible inventory before and after the host workflow, outside the source directory:
+Artifact-required cases must stage concrete fixtures in an isolated directory and grant the host access only to that staged copy. Use Bash with GNU `find`, `sort`, `readlink`, `base64`, and `sha256sum` to record two inventories outside the source tree: entry structure and regular-file bytes.
 
 ```bash
-fixture_root=host-fixtures/<release>/<case>/sources
-evidence_root=host-fixtures/<release>/<case>/evidence
+set -euo pipefail
+fixture_root=host-fixtures/continuity-v1-rc1/canonical_predecessor_approved_successor/sources
+evidence_root=host-fixtures/continuity-v1-rc1/canonical_predecessor_approved_successor/evidence
 mkdir -p "$evidence_root"
-(cd "$fixture_root" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$evidence_root/before.sha256"
-# Run the host workflow against only "$fixture_root".
-(cd "$fixture_root" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$evidence_root/after.sha256"
-sha256sum "$evidence_root/before.sha256" "$evidence_root/after.sha256"
-diff -u "$evidence_root/before.sha256" "$evidence_root/after.sha256"
+
+write_structure_inventory() {
+  local root=$1 output=$2 entry kind target_base64
+  (
+    cd "$root"
+    while IFS= read -r -d '' entry; do
+      target_base64=-
+      if [[ -L "$entry" ]]; then
+        kind=symlink
+        target_base64=$(readlink -n -- "$entry" | base64 -w0)
+      elif [[ -f "$entry" ]]; then kind=regular
+      elif [[ -d "$entry" ]]; then kind=directory
+      elif [[ -b "$entry" ]]; then kind=block_device
+      elif [[ -c "$entry" ]]; then kind=character_device
+      elif [[ -p "$entry" ]]; then kind=fifo
+      elif [[ -S "$entry" ]]; then kind=socket
+      else kind=other
+      fi
+      printf '%s\t%q\t%s\n' "$kind" "$entry" "$target_base64"
+    done < <(LC_ALL=C find . -mindepth 1 -print0 | LC_ALL=C sort -z)
+  ) > "$output"
+}
+
+write_regular_file_hashes() {
+  local root=$1 output=$2 entry digest
+  (
+    cd "$root"
+    while IFS= read -r -d '' entry; do
+      digest=$(sha256sum -- "$entry")
+      printf '%s\t%q\n' "${digest%% *}" "$entry"
+    done < <(LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z)
+  ) > "$output"
+}
+
+write_structure_inventory "$fixture_root" "$evidence_root/before.structure"
+write_regular_file_hashes "$fixture_root" "$evidence_root/before.files.sha256"
+# Run the host workflow against only "$fixture_root" and its isolated output parent.
+write_structure_inventory "$fixture_root" "$evidence_root/after.structure"
+write_regular_file_hashes "$fixture_root" "$evidence_root/after.files.sha256"
+sha256sum "$evidence_root"/before.* "$evidence_root"/after.*
+diff -u "$evidence_root/before.structure" "$evidence_root/after.structure"
+diff -u "$evidence_root/before.files.sha256" "$evidence_root/after.files.sha256"
 ```
 
-The `diff` must exit `0` with no output. The manifests cover file paths and bytes, so additions, removals, or byte changes fail. Record `fixture_bundle_id`, `source_root`, fixture acquisition hash, before/after manifest hashes, both manifest files, the diff command and output, host permissions, conversation link, evaluator, UTC time, and result. If concrete artifacts are not staged, mark host immutability `not measured`; rely only on the named deterministic source-preservation tests for byte-level evidence.
+Both diffs must exit `0` with no output. The structure inventory detects added or removed paths, empty directories, entry-type changes, special-file types, and symlink-target changes; symlink targets are base64 encoded and paths are Bash escaped. The byte inventory detects content changes to every regular-file path. It intentionally does not attest permission bits, ownership, timestamps, ACLs, extended attributes, device numbers, sparse allocation, or hard-link identity. Record `fixture_bundle_id`, `source_root`, fixture acquisition hash, before/after inventory hashes, all four inventory files, both diff commands and outputs, host permissions, conversation link, evaluator, UTC time, and result. If concrete artifacts are not staged, mark host immutability `not measured`; rely only on the named deterministic source-preservation tests for byte-level evidence.
 
 ### Evidence capture and release sign-off
 
@@ -104,11 +157,11 @@ Store a release record outside the plugin package in the team's durable release 
 - case `id`, observed skill, and observed status;
 - pass/fail for every required and forbidden semantic key;
 - pass/fail for user-decision behavior;
-- evaluation mode (`prompt-only` or `artifact-backed`) and source immutability scope (`not measured` or measured artifact record);
+- required and observed evaluation mode (`prompt_only` or `artifact_required`) and source immutability scope (`not measured` or measured artifact record);
 - conversation link or exported transcript and concise evidence excerpts;
 - final case result and notes for any rerun.
 
-The release owner signs off only after attaching the deterministic command output, the ten case records, a `10/10` host semantic pass summary, and confirmation that no exception to a release-blocking invariant was accepted. Claim host-level source immutability only for artifact-backed cases with matching before/after manifests; otherwise identify byte-level immutability as deterministic-test evidence. Record failures and their fixing commit; never overwrite the original failed evaluation record. This repository documents the method but does not claim that host evaluations have already run.
+The release owner signs off only after attaching the deterministic command output, the ten case records, a `10/10` required-mode host pass summary, and confirmation that no exception to a release-blocking invariant was accepted. Claim host-level source immutability only for artifact-required cases with matching before/after inventories; otherwise identify byte-level immutability as deterministic-test evidence. Record failures and their fixing commit; never overwrite the original failed evaluation record. This repository documents the method but does not claim that host evaluations have already run.
 
 ## Design coverage checklist
 
@@ -125,7 +178,7 @@ This checklist maps design sections 6–17 to shipped implementation and direct 
 | 12. Readiness rules | `skills/project-intelligence/scripts/continuity/readiness.py::classify_readiness`; `skills/project-intelligence/assets/schemas/preflight.schema.json` | `tests/unit/test_readiness_redaction.py::test_readiness_uses_explicit_gates`; `tests/contract/test_schemas.py::test_blocked_preflight_cannot_name_an_execution_stage` |
 | 13. Error handling | `skills/project-intelligence/scripts/continuity/archives.py`, `redaction.py`, `packaging.py`, and `cli.py` | `tests/unit/test_archives.py`; `tests/unit/test_readiness_redaction.py::test_redacts_likely_secrets_without_destroying_source_context`; invalid-input cases in `tests/integration/test_end_to_end.py` |
 | 14. Capability decisions | `.codex-plugin/plugin.json` and the five skills-only workflows | `tests/contract/test_plugin_layout.py::test_plugin_manifest_declares_skills_only`; `tests/contract/test_plugin_layout.py::test_five_skill_files_exist` |
-| 15. Validation plan | `skills/project-intelligence/scripts/continuity/packaging.py::validate_package`, JSON Schemas, the deterministic CLI, and `tests/behavioral/cases.json` | contract, unit, integration, and behavioral suites collected by full pytest |
+| 15. Validation plan | `skills/project-intelligence/scripts/continuity/packaging.py::validate_package`, `skills/project-intelligence/assets/schemas/`, `skills/project-intelligence/scripts/continuity/cli.py`, and `tests/behavioral/cases.json` | `tests/contract/test_schemas.py::test_schema_is_valid_draft_2020_12`; `tests/unit/test_packaging.py::test_validation_recalculates_digests_from_current_bytes`; `tests/integration/test_end_to_end.py::test_ready_workflow_preserves_sources_and_candidate_bytes`; `tests/behavioral/test_case_contract.py::test_exact_reviewed_cases_and_prompts_pass_release_contract` |
 | 16. Release-blocking invariants | fail-closed gates in `skills/project-intelligence/scripts/continuity/reconciliation.py`, `readiness.py`, and `packaging.py` | direct invariant matrix below |
 | 17. Acceptance criteria | complete plugin resources and `skills/project-intelligence/scripts/continuity/cli.py` inspect-to-preflight flow | `tests/contract/test_plugin_layout.py`; `tests/contract/test_skill_contracts.py`; `tests/integration/test_end_to_end.py::test_ready_workflow_preserves_sources_and_candidate_bytes`; `tests/integration/test_end_to_end.py::test_architecture_conflict_blocks_candidate_and_implementation_recommendation` |
 

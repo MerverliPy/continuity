@@ -201,4 +201,4 @@ The behavioral matrix is contract-tested separately:
 .venv/bin/python -m pytest -q tests/behavioral/test_case_contract.py
 ```
 
-Deterministic tests prove code, schema, resource, and case-contract behavior. They do not prove ChatGPT skill routing. Every release must also run all ten cases in fresh host conversations and capture semantic evidence. See [the evaluation and release sign-off guide](docs/evaluation.md).
+Deterministic tests prove code, schema, resource, and case-contract behavior. They do not prove ChatGPT skill routing. Every release must run all ten versioned stimuli in fresh host conversations using each case's required mode: nine are prompt-only semantic evaluations, while promotion requires staged artifacts, actual tool execution, package validation, and hash evidence. A text-only promotion response cannot pass. See [the evaluation and release sign-off guide](docs/evaluation.md).
