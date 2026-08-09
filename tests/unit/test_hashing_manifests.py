@@ -32,6 +32,41 @@ def test_checksum_file_is_excluded_from_its_own_inventory(tmp_path: Path) -> Non
     ]
 
 
+def test_checksum_generation_does_not_overwrite_an_existing_destination(tmp_path: Path) -> None:
+    """Catches source evidence being overwritten when a checksum sidecar already exists."""
+    destination = tmp_path / "SHA256SUMS.txt"
+    destination.write_bytes(b"original evidence\n")
+
+    with pytest.raises(FileExistsError):
+        write_sha256s(tmp_path, destination)
+
+    assert destination.read_bytes() == b"original evidence\n"
+
+
+def test_checksum_generation_rejects_destination_outside_root(tmp_path: Path) -> None:
+    """Catches a checksum operation mutating a path outside its explicit package root."""
+    outside = tmp_path.parent / "outside-SHA256SUMS.txt"
+
+    with pytest.raises(ValueError, match="inside root"):
+        write_sha256s(tmp_path, outside)
+
+    assert outside.exists() is False
+
+
+def test_checksum_generation_rejects_a_symlinked_parent(tmp_path: Path) -> None:
+    """Catches a lexical in-root destination being redirected into external evidence."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    redirected_destination = outside / "SHA256SUMS.txt"
+    redirected_destination.write_bytes(b"external evidence\n")
+    (tmp_path / "redirect").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_sha256s(tmp_path, tmp_path / "redirect" / "SHA256SUMS.txt")
+
+    assert redirected_destination.read_bytes() == b"external evidence\n"
+
+
 def test_invalid_evidence_state_is_rejected() -> None:
     """Catches accidental acceptance of unrecognized evidence vocabulary."""
     with pytest.raises(ValueError):

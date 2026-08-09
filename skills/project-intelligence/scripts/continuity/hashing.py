@@ -82,14 +82,13 @@ def write_sha256s(root: Path, destination: Path) -> None:
 
     root = Path(root).absolute()
     destination = Path(destination).absolute()
+    relative_destination = _safe_checksum_destination(root, destination)
     records = inventory_tree(root, source_id="checksum-inventory")
-    destination_path = _relative_destination(root, destination)
+    destination_path = normalize_relative_path(relative_destination)
     if destination_path is not None:
         records = tuple(record for record in records if record.normalized_path != destination_path)
     lines = [f"{record.sha256}  {record.normalized_path}" for record in records]
-    if destination.exists() and stat.S_ISLNK(destination.lstat().st_mode):
-        raise ValueError(f"checksum destination may not be a symlink: {destination}")
-    destination.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    _write_new_checksum(root, relative_destination, "\n".join(lines) + ("\n" if lines else ""))
 
 
 def verify_sha256s(root: Path, checksum_file: Path) -> VerificationReport:
@@ -146,6 +145,54 @@ def _relative_destination(root: Path, destination: Path) -> str | None:
         return normalize_relative_path(destination.relative_to(root))
     except ValueError:
         return None
+
+
+def _safe_checksum_destination(root: Path, destination: Path) -> Path:
+    """Validate a new checksum path without resolving or following symlinks."""
+
+    try:
+        relative_destination = destination.relative_to(root)
+    except ValueError as error:
+        raise ValueError("checksum destination must be inside root") from error
+    if not relative_destination.parts:
+        raise ValueError("checksum destination must name a file inside root")
+
+    current = root
+    for component in relative_destination.parts[:-1]:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"checksum parent does not exist: {current}") from error
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"checksum destination parent may not be a symlink: {current}")
+        if not stat.S_ISDIR(mode):
+            raise NotADirectoryError(f"checksum destination parent is not a directory: {current}")
+
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        return relative_destination
+    raise FileExistsError(f"checksum destination already exists: {destination}")
+
+
+def _write_new_checksum(root: Path, relative_destination: Path, text: str) -> None:
+    """Create one UTF-8 checksum file exclusively beneath an already-safe root."""
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_descriptor = os.open(root, directory_flags)
+    directory_descriptor = root_descriptor
+    try:
+        for component in relative_destination.parts[:-1]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = os.open(relative_destination.name, file_flags, 0o644, dir_fd=directory_descriptor)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="\n") as checksum_file:
+            checksum_file.write(text)
+    finally:
+        os.close(directory_descriptor)
 
 
 def _read_checksum_file(checksum_file: Path) -> dict[str, str]:
