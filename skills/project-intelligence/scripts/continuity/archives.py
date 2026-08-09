@@ -16,6 +16,13 @@ from .paths import normalize_relative_path
 
 _COPY_CHUNK_SIZE = 1024 * 1024
 _MALFORMED_FILENAME_VIOLATION = "malformed ZIP filename encoding"
+_UNIX_FILE_TYPE_NAMES = {
+    stat.S_IFIFO: "fifo",
+    stat.S_IFCHR: "character-device",
+    stat.S_IFBLK: "block-device",
+    stat.S_IFLNK: "symbolic-link",
+    stat.S_IFSOCK: "socket",
+}
 
 
 @dataclass(frozen=True)
@@ -145,9 +152,16 @@ def _inspect_open_zip(archive: zipfile.ZipFile, policy: ArchivePolicy) -> Archiv
         if info.is_dir() and info.file_size != 0:
             violations.add(f"directory entry has nonzero payload: {observed_path!r}")
 
-        unix_mode = info.external_attr >> 16
-        if stat.S_ISLNK(unix_mode):
-            violations.add(f"symbolic link entry is not allowed: {observed_path!r}")
+        unsupported_unix_type = _unsupported_unix_file_type(info)
+        if unsupported_unix_type is not None:
+            file_type, type_name = unsupported_unix_type
+            if file_type == stat.S_IFLNK:
+                violations.add(f"symbolic link entry is not allowed: {observed_path!r}")
+            else:
+                violations.add(
+                    "archive.unsupported-unix-file-type: "
+                    f"{type_name} entry {observed_path!r} is not allowed"
+                )
 
         if normalized_path is None:
             continue
@@ -190,7 +204,7 @@ def _inspect_open_zip(archive: zipfile.ZipFile, policy: ArchivePolicy) -> Archiv
 
     if expansion_safe:
         for info in infos:
-            if info.flag_bits & 1:
+            if info.flag_bits & 1 or _unsupported_unix_file_type(info) is not None:
                 continue
             _verify_member_bytes(archive, info, violations)
 
@@ -204,6 +218,16 @@ def _compression_ratio(info: zipfile.ZipInfo) -> float:
     if info.compress_size == 0:
         return float("inf")
     return info.file_size / info.compress_size
+
+
+def _unsupported_unix_file_type(info: zipfile.ZipInfo) -> tuple[int, str] | None:
+    if info.create_system != 3:
+        return None
+    file_type = stat.S_IFMT(info.external_attr >> 16)
+    if file_type in (0, stat.S_IFREG, stat.S_IFDIR):
+        return None
+    type_name = _UNIX_FILE_TYPE_NAMES.get(file_type, f"type-0o{file_type:o}")
+    return file_type, type_name
 
 
 def _find_parent_file_conflicts(path_kinds: dict[str, bool], violations: _Violations) -> None:

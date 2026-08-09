@@ -57,6 +57,15 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _write_typed_entry(path: Path, *, create_system: int, file_type: int) -> None:
+    special = zipfile.ZipInfo("special-entry")
+    special.create_system = create_system
+    special.external_attr = (file_type | 0o600) << 16
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("safe-first.txt", b"safe")
+        archive.writestr(special, b"special payload")
+
+
 @pytest.mark.parametrize(
     "unsafe_name",
     ["../escape.txt", "/absolute.txt", "C:/drive.txt", "..\\escape.txt"],
@@ -114,6 +123,67 @@ def test_symlink_entries_are_rejected(tmp_path: Path) -> None:
 
     assert inspection.safe is False
     assert any("symbolic link" in violation for violation in inspection.violations)
+
+
+@pytest.mark.parametrize(
+    ("file_type", "type_name"),
+    [
+        (stat.S_IFIFO, "fifo"),
+        (stat.S_IFCHR, "character-device"),
+        (stat.S_IFBLK, "block-device"),
+        (stat.S_IFSOCK, "socket"),
+        (0o130000, "type-0o130000"),
+    ],
+)
+def test_unix_special_file_types_are_rejected_without_touching_source_or_destination(
+    tmp_path: Path, file_type: int, type_name: str
+) -> None:
+    """Catches Unix special members being silently materialized as regular files."""
+    archive_path = tmp_path / f"{type_name}.zip"
+    destination = tmp_path / f"{type_name}-output"
+    _write_typed_entry(archive_path, create_system=3, file_type=file_type)
+    original_hash = _sha256(archive_path)
+    expected_violation = (
+        f"archive.unsupported-unix-file-type: {type_name} entry 'special-entry' is not allowed"
+    )
+
+    inspected = inspect_zip(archive_path)
+    extracted = safe_extract_zip(archive_path, destination)
+
+    assert inspected.safe is False
+    assert inspected.violations == (expected_violation,)
+    assert extracted == inspected
+    assert destination.exists() is False
+    assert _sha256(archive_path) == original_hash
+
+
+def test_non_unix_creator_mode_bits_are_not_interpreted_as_unix_file_types(
+    tmp_path: Path,
+) -> None:
+    """Catches DOS/platform metadata being mistaken for a Unix special-file mode."""
+    archive_path = tmp_path / "platform-mode.zip"
+    _write_typed_entry(archive_path, create_system=0, file_type=stat.S_IFIFO)
+
+    inspection = inspect_zip(archive_path)
+
+    assert inspection.safe is True
+
+
+def test_unix_special_type_is_rejected_before_payload_verification(tmp_path: Path) -> None:
+    """Catches an unsafe special member being opened before its type rejection."""
+    archive_path = tmp_path / "corrupt-fifo.zip"
+    fifo = zipfile.ZipInfo("special-entry")
+    fifo.create_system = 3
+    fifo.external_attr = (stat.S_IFIFO | 0o600) << 16
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(fifo, b"corrupt me")
+    _corrupt_first_payload(archive_path)
+
+    inspection = inspect_zip(archive_path)
+
+    assert inspection.violations == (
+        "archive.unsupported-unix-file-type: fifo entry 'special-entry' is not allowed",
+    )
 
 
 def test_encrypted_entries_are_rejected(tmp_path: Path) -> None:
