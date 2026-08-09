@@ -44,6 +44,15 @@ def _corrupt_first_payload(path: Path) -> None:
     path.write_bytes(data)
 
 
+def _set_invalid_utf8_central_filename(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    central_header = data.index(b"PK\x01\x02")
+    flags = struct.unpack_from("<H", data, central_header + 8)[0]
+    struct.pack_into("<H", data, central_header + 8, flags | 0x800)
+    data[central_header + 46] = 0xFF
+    path.write_bytes(data)
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -132,6 +141,22 @@ def test_corrupt_member_payload_is_rejected(tmp_path: Path, compression: int) ->
     assert any("corrupt" in violation for violation in inspection.violations)
 
 
+def test_corrupt_directory_payload_is_rejected_before_extraction(tmp_path: Path) -> None:
+    """Catches directory members bypassing payload and local-header validation."""
+    archive_path = tmp_path / "corrupt-directory.zip"
+    destination = tmp_path / "output"
+    _write_zip(archive_path, [("folder/", b"hidden payload")])
+    _corrupt_first_payload(archive_path)
+
+    inspection = inspect_zip(archive_path)
+    extracted = safe_extract_zip(archive_path, destination)
+
+    assert inspection.safe is False
+    assert any("directory" in violation for violation in inspection.violations)
+    assert extracted.safe is False
+    assert destination.exists() is False
+
+
 def test_truncated_archive_is_rejected(tmp_path: Path) -> None:
     """Catches incomplete ZIP data being mistaken for an empty or safe archive."""
     archive_path = tmp_path / "truncated.zip"
@@ -142,6 +167,32 @@ def test_truncated_archive_is_rejected(tmp_path: Path) -> None:
 
     assert inspection.safe is False
     assert any("corrupt" in violation for violation in inspection.violations)
+
+
+def test_inspection_returns_stable_violation_for_invalid_utf8_filename(tmp_path: Path) -> None:
+    """Catches malformed central-directory names escaping the inspection API."""
+    archive_path = tmp_path / "invalid-filename.zip"
+    _write_zip(archive_path, [("a.txt", b"contents")])
+    _set_invalid_utf8_central_filename(archive_path)
+
+    inspection = inspect_zip(archive_path)
+
+    assert inspection.safe is False
+    assert inspection.violations == ("malformed ZIP filename encoding",)
+
+
+def test_extraction_returns_stable_violation_for_invalid_utf8_filename(tmp_path: Path) -> None:
+    """Catches malformed central-directory names escaping extraction or creating output."""
+    archive_path = tmp_path / "invalid-filename.zip"
+    destination = tmp_path / "output"
+    _write_zip(archive_path, [("a.txt", b"contents")])
+    _set_invalid_utf8_central_filename(archive_path)
+
+    inspection = safe_extract_zip(archive_path, destination)
+
+    assert inspection.safe is False
+    assert inspection.violations == ("malformed ZIP filename encoding",)
+    assert destination.exists() is False
 
 
 def test_entry_limit_is_enforced(tmp_path: Path) -> None:

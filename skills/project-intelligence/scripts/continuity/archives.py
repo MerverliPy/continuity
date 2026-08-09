@@ -15,6 +15,7 @@ from .paths import normalize_relative_path
 
 
 _COPY_CHUNK_SIZE = 1024 * 1024
+_MALFORMED_FILENAME_VIOLATION = "malformed ZIP filename encoding"
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ def inspect_zip(path: Path, policy: ArchivePolicy = ArchivePolicy()) -> ArchiveI
     try:
         with zipfile.ZipFile(Path(path), "r") as archive:
             return _inspect_open_zip(archive, policy)
+    except UnicodeDecodeError:
+        return _malformed_filename_inspection()
     except (zipfile.BadZipFile, EOFError) as error:
         return _corrupt_inspection(error)
 
@@ -91,6 +94,8 @@ def safe_extract_zip(
                 return inspection
             _extract_open_zip(archive, destination, policy)
             return inspection
+    except UnicodeDecodeError:
+        return _malformed_filename_inspection()
     except (zipfile.BadZipFile, EOFError) as error:
         return _corrupt_inspection(error)
 
@@ -137,6 +142,9 @@ def _inspect_open_zip(archive: zipfile.ZipFile, policy: ArchivePolicy) -> Archiv
         if info.flag_bits & 1:
             violations.add(f"encrypted entry is not allowed: {observed_path!r}")
 
+        if info.is_dir() and info.file_size != 0:
+            violations.add(f"directory entry has nonzero payload: {observed_path!r}")
+
         unix_mode = info.external_attr >> 16
         if stat.S_ISLNK(unix_mode):
             violations.add(f"symbolic link entry is not allowed: {observed_path!r}")
@@ -182,7 +190,7 @@ def _inspect_open_zip(archive: zipfile.ZipFile, policy: ArchivePolicy) -> Archiv
 
     if expansion_safe:
         for info in infos:
-            if info.is_dir() or info.flag_bits & 1:
+            if info.flag_bits & 1:
                 continue
             _verify_member_bytes(archive, info, violations)
 
@@ -219,6 +227,9 @@ def _verify_member_bytes(
         with archive.open(info, "r") as source:
             while chunk := source.read(_COPY_CHUNK_SIZE):
                 actual_size += len(chunk)
+    except UnicodeDecodeError:
+        violations.add(_MALFORMED_FILENAME_VIOLATION)
+        return
     except (zipfile.BadZipFile, EOFError, OSError, RuntimeError, zlib.error) as error:
         violations.add(f"corrupt member {info.filename!r}: {error}")
         return
@@ -286,4 +297,12 @@ def _corrupt_inspection(error: BaseException) -> ArchiveInspection:
         safe=False,
         entries=(),
         violations=(f"corrupt or truncated ZIP archive: {error}",),
+    )
+
+
+def _malformed_filename_inspection() -> ArchiveInspection:
+    return ArchiveInspection(
+        safe=False,
+        entries=(),
+        violations=(_MALFORMED_FILENAME_VIOLATION,),
     )
