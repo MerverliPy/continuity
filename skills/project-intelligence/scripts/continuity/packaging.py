@@ -257,6 +257,7 @@ def validate_package(root: Path) -> PackageValidation:
         _validate_evidence_structure(evidence_index, violations)
     if reconciliation is not None:
         _validate_reconciliation_structure(reconciliation, violations)
+        _validate_selected_project_identity(reconciliation, project_id, violations)
     if (
         reconciliation is not None
         and reconciliation.get("blocking_conflict_ids")
@@ -277,8 +278,8 @@ def validate_package(root: Path) -> PackageValidation:
             violations.append("lineage readiness does not match manifest")
         if lineage.get("source_hashes") != manifest.get("selected_source_hashes"):
             violations.append("lineage source hashes do not match manifest selected sources")
-        if sorted(lineage.get("parent_ids", [])) != manifest.get("lineage_roots"):
-            violations.append("lineage parents do not match manifest lineage_roots")
+        if lineage.get("root_package_ids") != manifest.get("lineage_roots"):
+            violations.append("lineage roots do not match manifest lineage_roots")
 
     if status is PackageStatus.CANONICAL:
         promotion = _read_json_object(
@@ -450,9 +451,20 @@ def _validate_request(request: CandidateBuildRequest) -> None:
     if evidence_violations:
         raise ValueError(evidence_violations[0])
     try:
+        reconciliation = request.approved_reconciliation_report.to_dict()
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("reconciliation report is not structurally valid") from error
+    reconciliation_violations: list[str] = []
+    _validate_reconciliation_structure(reconciliation, reconciliation_violations)
+    _validate_selected_project_identity(
+        reconciliation, request.project_id, reconciliation_violations
+    )
+    if reconciliation_violations:
+        raise ValueError(reconciliation_violations[0])
+    try:
         json.dumps(request.lineage_data)
         json.dumps(request.evidence_index)
-        json.dumps(request.approved_reconciliation_report.to_dict())
+        json.dumps(reconciliation)
     except (TypeError, ValueError) as error:
         raise ValueError("structured package inputs must be JSON serializable") from error
 
@@ -736,7 +748,7 @@ def _update_successor_lineage(
     lineage["created_at"] = successor_created_at
     lineage["status"] = PackageStatus.CANONICAL.value
     lineage["readiness"] = readiness.value
-    lineage["parent_ids"] = sorted(set(existing) | {candidate_id})
+    lineage["parent_ids"] = [candidate_id]
     path.unlink()
     _write_json_new(path, lineage)
 
@@ -755,13 +767,10 @@ def _package_sha256(root: Path) -> str:
 
 
 def _lineage_roots(lineage: Mapping[str, object]) -> tuple[str, ...]:
-    roots = lineage.get("root_package_ids", ())
+    roots = lineage.get("root_package_ids")
     if isinstance(roots, list) and all(isinstance(item, str) for item in roots):
         return tuple(sorted(roots))
-    parents = lineage.get("parent_ids", ())
-    if isinstance(parents, list) and all(isinstance(item, str) for item in parents):
-        return tuple(sorted(parents))
-    return ()
+    raise ValueError("lineage root_package_ids must be a string list")
 
 
 def _validate_tree_types(root: Path, violations: list[str]) -> None:
@@ -900,6 +909,9 @@ def _validate_lineage_structure(
     _enum_value(PackageStatus, lineage.get("status"), "lineage status", violations)
     _enum_value(ReadinessStatus, lineage.get("readiness"), "lineage readiness", violations)
     _validate_string_list(lineage.get("parent_ids"), "lineage parent_ids", violations)
+    _validate_string_list(
+        lineage.get("root_package_ids"), "lineage root_package_ids", violations
+    )
     _validate_source_hashes(lineage.get("source_hashes"), "lineage source_hashes", violations)
 
 
@@ -924,20 +936,226 @@ def _validate_evidence_structure(
 def _validate_reconciliation_structure(
     reconciliation: Mapping[str, object], violations: list[str]
 ) -> None:
-    list_fields = (
-        "claims",
-        "conflicts",
-        "findings",
-        "approvals",
-        "selected_claim_ids",
-        "blocking_conflict_ids",
-        "notes",
-    )
-    for field in list_fields:
-        if not isinstance(reconciliation.get(field), list):
-            violations.append(f"reconciliation {field} must be a list")
-    if isinstance(reconciliation.get("findings"), list) and not reconciliation["findings"]:
+    claims = _object_list(reconciliation, "claims", violations)
+    claim_ids: set[str] = set()
+    for index, claim in enumerate(claims):
+        label = f"reconciliation claim {index}"
+        claim_id = _record_id(claim, "claim_id", label, claim_ids, violations)
+        for field in ("field", "source_id", "source_ref"):
+            _nonempty_string(claim.get(field), f"{label} {field}", violations)
+        _enum_value(
+            EvidenceState,
+            claim.get("evidence_state"),
+            f"{label} evidence_state",
+            violations,
+        )
+        _validate_optional_timestamp(claim.get("recorded_at"), f"{label} recorded_at", violations)
+        if claim_id is None:
+            continue
+
+    approvals = _object_list(reconciliation, "approvals", violations)
+    approval_ids: set[str] = set()
+    approvals_by_id: dict[str, Mapping[str, object]] = {}
+    for index, approval in enumerate(approvals):
+        label = f"reconciliation approval {index}"
+        approval_id = _record_id(
+            approval, "approval_id", label, approval_ids, violations
+        )
+        for field in ("action", "decision", "source_id", "source_ref"):
+            _nonempty_string(approval.get(field), f"{label} {field}", violations)
+        _validate_exact_string_list(approval.get("scope"), f"{label} scope", violations)
+        _rfc3339_value(approval.get("approved_at"), f"{label} approved_at", violations)
+        if approval_id is not None:
+            approvals_by_id[approval_id] = approval
+
+    conflicts = _object_list(reconciliation, "conflicts", violations)
+    conflict_ids: set[str] = set()
+    unresolved_material: set[str] = set()
+    conflicts_by_id: dict[str, Mapping[str, object]] = {}
+    for index, conflict in enumerate(conflicts):
+        label = f"reconciliation conflict {index}"
+        conflict_id = _record_id(
+            conflict, "conflict_id", label, conflict_ids, violations
+        )
+        _nonempty_string(conflict.get("field"), f"{label} field", violations)
+        material = conflict.get("material")
+        if not isinstance(material, bool):
+            violations.append(f"{label} material must be boolean")
+        referenced_claims = _validate_exact_string_list(
+            conflict.get("claim_ids"), f"{label} claim_ids", violations, nonempty=True
+        )
+        for claim_id in referenced_claims:
+            if claim_id not in claim_ids:
+                violations.append(f"{label} references absent claim {claim_id}")
+        resolution_id = conflict.get("resolution_approval_id")
+        if resolution_id is not None and (
+            not isinstance(resolution_id, str) or not resolution_id.strip()
+        ):
+            violations.append(f"{label} resolution_approval_id must be null or non-empty text")
+        if conflict_id is not None:
+            conflicts_by_id[conflict_id] = conflict
+            if material is True and resolution_id is None:
+                unresolved_material.add(conflict_id)
+        if isinstance(resolution_id, str) and resolution_id.strip():
+            approval = approvals_by_id.get(resolution_id)
+            if approval is None:
+                violations.append(f"{label} references absent resolution approval")
+            elif (
+                approval.get("action") != "resolve-conflict"
+                or approval.get("scope") != [conflict_id]
+                or approval.get("decision") not in referenced_claims
+            ):
+                violations.append(f"{label} resolution approval is not exact")
+
+    findings = _object_list(reconciliation, "findings", violations)
+    if not findings:
         violations.append("reconciliation findings must be non-empty")
+    finding_ids: set[str] = set()
+    for index, finding in enumerate(findings):
+        label = f"reconciliation finding {index}"
+        _record_id(finding, "finding_id", label, finding_ids, violations)
+        _nonempty_string(finding.get("source_id"), f"{label} source_id", violations)
+        _enum_value(
+            EvidenceState,
+            finding.get("evidence_state"),
+            f"{label} evidence_state",
+            violations,
+        )
+        if not isinstance(finding.get("detail"), str):
+            violations.append(f"{label} detail must be text")
+        for field in ("structurally_valid", "lineage_valid"):
+            if finding.get(field) is not None and not isinstance(finding.get(field), bool):
+                violations.append(f"{label} {field} must be boolean or null")
+        if not isinstance(finding.get("lineage_required"), bool):
+            violations.append(f"{label} lineage_required must be boolean")
+        for field in ("expected_sha256", "observed_sha256"):
+            value = finding.get(field)
+            if value is not None and not _is_sha256(value):
+                violations.append(f"{label} {field} must be null or SHA-256")
+
+    selected = _validate_exact_string_list(
+        reconciliation.get("selected_claim_ids"),
+        "reconciliation selected_claim_ids",
+        violations,
+    )
+    for claim_id in selected:
+        if claim_id not in claim_ids:
+            violations.append(
+                f"reconciliation selected_claim_ids references absent claim {claim_id}"
+            )
+
+    blocking = _validate_exact_string_list(
+        reconciliation.get("blocking_conflict_ids"),
+        "reconciliation blocking_conflict_ids",
+        violations,
+    )
+    for conflict_id in blocking:
+        conflict = conflicts_by_id.get(conflict_id)
+        if (
+            conflict is None
+            or conflict.get("material") is not True
+            or conflict.get("resolution_approval_id") is not None
+        ):
+            violations.append(
+                "reconciliation blocking_conflict_ids must reference material unresolved conflicts"
+            )
+    if set(blocking) != unresolved_material:
+        violations.append(
+            "reconciliation blocking_conflict_ids must equal material unresolved conflicts"
+        )
+
+    notes = reconciliation.get("notes")
+    if not isinstance(notes, list) or any(not isinstance(note, str) for note in notes):
+        violations.append("reconciliation notes must be a string list")
+
+
+def _validate_selected_project_identity(
+    reconciliation: Mapping[str, object],
+    project_id: object,
+    violations: list[str],
+) -> None:
+    claims = reconciliation.get("claims")
+    selected = reconciliation.get("selected_claim_ids")
+    if not isinstance(claims, list) or not isinstance(selected, list):
+        return
+    selected_set = {item for item in selected if isinstance(item, str)}
+    project_claims = [
+        claim
+        for claim in claims
+        if isinstance(claim, Mapping)
+        and _normalize_claim_field(claim.get("field")) == "project id"
+        and claim.get("claim_id") in selected_set
+    ]
+    if len(project_claims) != 1:
+        violations.append("reconciliation must select exactly one project_id claim")
+        return
+    if project_claims[0].get("value") != project_id:
+        violations.append("reconciliation selected project_id does not match active project")
+
+
+def _object_list(
+    value: Mapping[str, object], field: str, violations: list[str]
+) -> list[Mapping[str, object]]:
+    items = value.get(field)
+    if not isinstance(items, list):
+        violations.append(f"reconciliation {field} must be a list")
+        return []
+    objects: list[Mapping[str, object]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            violations.append(f"reconciliation {field} item {index} must be an object")
+        else:
+            objects.append(item)
+    return objects
+
+
+def _record_id(
+    record: Mapping[str, object],
+    field: str,
+    label: str,
+    seen: set[str],
+    violations: list[str],
+) -> str | None:
+    value = _nonempty_string(record.get(field), f"{label} {field}", violations)
+    if value is None:
+        return None
+    if value in seen:
+        violations.append(f"{label} {field} must be unique")
+    seen.add(value)
+    return value
+
+
+def _validate_optional_timestamp(
+    value: object, label: str, violations: list[str]
+) -> None:
+    if value is not None:
+        _rfc3339_value(value, label, violations)
+
+
+def _validate_exact_string_list(
+    value: object,
+    label: str,
+    violations: list[str],
+    *,
+    nonempty: bool = False,
+) -> list[str]:
+    if not isinstance(value, list):
+        violations.append(f"{label} must be a string list")
+        return []
+    if nonempty and not value:
+        violations.append(f"{label} must be non-empty")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        violations.append(f"{label} must contain non-empty text")
+        return []
+    if len(value) != len(set(value)):
+        violations.append(f"{label} must not contain duplicates")
+    return value
+
+
+def _normalize_claim_field(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return _normalize(value)
 
 
 def _validate_promotion_receipt(

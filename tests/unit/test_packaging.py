@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from continuity.hashing import sha256_file
+from continuity.hashing import sha256_file, write_sha256s
 from continuity.models import (
     ApprovalRecord,
     ClaimRecord,
@@ -17,6 +17,7 @@ from continuity.models import (
 from continuity.packaging import (
     CandidateBuildRequest,
     _publish_release_no_replace,
+    _write_manifest,
     build_candidate,
     promote_candidate,
     validate_package,
@@ -54,8 +55,26 @@ def _report(*, blocked: bool = False) -> ReconciliationReport:
             None,
         ),
     ) if blocked else ()
+    competing_claims = (
+        ClaimRecord(
+            "claim-monolith",
+            "architecture",
+            "monolith",
+            "source-tree",
+            "source/architecture-a.json",
+            EvidenceState.VERIFIED,
+        ),
+        ClaimRecord(
+            "claim-services",
+            "architecture",
+            "services",
+            "source-tree",
+            "source/architecture-b.json",
+            EvidenceState.VERIFIED,
+        ),
+    ) if blocked else ()
     return ReconciliationReport(
-        claims=(project,),
+        claims=(project, *competing_claims),
         approvals=(),
         findings=(
             IntegrityFinding(
@@ -109,6 +128,7 @@ def _request(
             "status": "Candidate",
             "readiness": readiness.value,
             "parent_ids": [],
+            "root_package_ids": [],
             "source_hashes": {
                 "source-tree": _tree_hash(source_root),
                 "input-zip": sha256_file(source_zip),
@@ -157,6 +177,28 @@ def _approval(package_id: str) -> ApprovalRecord:
         "conversation://approval/42",
         "2026-08-09T13:00:00Z",
     )
+
+
+def _regenerate_integrity(root: Path) -> None:
+    """Rebuild integrity metadata after an intentional validation probe."""
+    manifest_path = root / "MANIFEST.json"
+    checksum_path = root / "SHA256SUMS.txt"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.unlink()
+    checksum_path.unlink()
+    _write_manifest(
+        root,
+        package_id=manifest["package_id"],
+        project_id=manifest["project_id"],
+        created_at=manifest["created_at"],
+        status=PackageStatus(manifest["status"]),
+        readiness=ReadinessStatus(manifest["readiness"]),
+        selected_source_hashes=manifest["selected_source_hashes"],
+        lineage_roots=tuple(manifest["lineage_roots"]),
+        allow_conditional_promotion=manifest["allow_conditional_promotion"],
+        predecessor_package_id=manifest.get("predecessor_package_id"),
+    )
+    write_sha256s(root, checksum_path)
 
 
 def test_candidate_contract_is_complete_and_sources_are_unchanged(tmp_path: Path) -> None:
@@ -262,6 +304,114 @@ def test_validation_rejects_blocked_status_with_ready_readiness(tmp_path: Path) 
 
     assert not validation.valid
     assert any("lifecycle/readiness" in violation for violation in validation.violations)
+
+
+@pytest.mark.parametrize(
+    ("section", "mutation", "expected"),
+    (
+        ("claims", {"field": 7}, "reconciliation claim"),
+        ("findings", {"lineage_required": "yes"}, "reconciliation finding"),
+        ("findings", {"expected_sha256": "not-a-hash"}, "reconciliation finding"),
+    ),
+)
+def test_validation_rejects_malformed_nested_reconciliation_records(
+    tmp_path: Path, section: str, mutation: dict[str, object], expected: str
+) -> None:
+    """Catches well-shaped top-level receipt lists hiding malformed nested records."""
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt[section][0].update(mutation)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any(expected in violation for violation in validation.violations)
+    assert not any("checksum inventory" in violation for violation in validation.violations)
+
+
+def test_validation_rejects_invalid_nested_conflict_approval_and_references(
+    tmp_path: Path,
+) -> None:
+    """Catches unresolved/reference gates accepting malformed nested authority records."""
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["approvals"] = [
+        {
+            "approval_id": "resolution-1",
+            "action": "resolve-conflict",
+            "scope": ["wrong-conflict"],
+            "decision": "missing-claim",
+            "source_id": "user",
+            "source_ref": "conversation://resolution/1",
+            "approved_at": "not-rfc3339",
+        }
+    ]
+    receipt["conflicts"] = [
+        {
+            "conflict_id": "conflict-1",
+            "field": "architecture",
+            "material": True,
+            "claim_ids": ["missing-claim"],
+            "resolution_approval_id": "resolution-1",
+        }
+    ]
+    receipt["selected_claim_ids"] = ["missing-selected"]
+    receipt["blocking_conflict_ids"] = ["conflict-1"]
+    receipt["notes"] = [7]
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("reconciliation approval" in violation for violation in validation.violations)
+    assert any("reconciliation conflict" in violation for violation in validation.violations)
+    assert any("selected_claim_ids" in violation for violation in validation.violations)
+    assert any("notes" in violation for violation in validation.violations)
+
+
+def test_validation_binds_selected_project_claim_to_manifest_identity(tmp_path: Path) -> None:
+    """Catches checksummed reconciliation selecting a different active project."""
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["claims"][0]["value"] = "beta"
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("selected project_id" in violation for violation in validation.violations)
+
+
+@pytest.mark.parametrize("case", ("absent", "unselected", "multiple"))
+def test_validation_requires_exactly_one_selected_project_claim(
+    tmp_path: Path, case: str
+) -> None:
+    """Catches absent, unselected, or ambiguous project authority in a valid receipt."""
+    result = build_candidate(_request(tmp_path))
+    receipt_path = result.root / "receipts/RECONCILIATION.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if case == "absent":
+        receipt["claims"][0]["field"] = "goal"
+    elif case == "unselected":
+        receipt["selected_claim_ids"] = []
+    else:
+        duplicate = {**receipt["claims"][0], "claim_id": "project-alpha-second"}
+        receipt["claims"].append(duplicate)
+        receipt["selected_claim_ids"].append(duplicate["claim_id"])
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert any("exactly one project_id" in violation for violation in validation.violations)
 
 
 def test_candidate_zip_has_sorted_entries_and_fixed_metadata(tmp_path: Path) -> None:
@@ -497,6 +647,65 @@ def test_lineage_source_hashes_must_match_selected_sources(tmp_path: Path) -> No
         build_candidate(request)
 
     assert not request.output.exists()
+
+
+def test_build_rejects_mismatched_selected_project_claim(tmp_path: Path) -> None:
+    """Catches request identity being accepted without reconciliation authority."""
+    report = _report()
+    mismatched = ClaimRecord(
+        report.claims[0].claim_id,
+        report.claims[0].field,
+        "beta",
+        report.claims[0].source_id,
+        report.claims[0].source_ref,
+        report.claims[0].evidence_state,
+    )
+    report = ReconciliationReport(
+        claims=(mismatched,),
+        approvals=report.approvals,
+        findings=report.findings,
+        conflicts=report.conflicts,
+        selected_claim_ids=(mismatched.claim_id,),
+        notes=report.notes,
+    )
+    request = _request(tmp_path, report=report)
+
+    with pytest.raises(ValueError, match="selected project_id"):
+        build_candidate(request)
+
+    assert not request.output.exists()
+
+
+def test_three_generation_lineage_preserves_roots_and_direct_parents(tmp_path: Path) -> None:
+    """Catches direct parents being conflated with stable lineage roots after promotion."""
+    request = _request(tmp_path, package_id="generation-3")
+    lineage = {
+        **request.lineage_data,
+        "parent_ids": ["generation-2"],
+        "root_package_ids": ["generation-1"],
+    }
+    request = CandidateBuildRequest(**{**request.__dict__, "lineage_data": lineage})
+
+    candidate = build_candidate(request)
+    candidate_manifest = json.loads((candidate.root / "MANIFEST.json").read_text())
+    assert candidate_manifest["lineage_roots"] == ["generation-1"]
+    assert validate_package(candidate.root).valid
+
+    canonical = promote_candidate(
+        candidate.root,
+        tmp_path / "generation-4",
+        _approval(candidate.package_id),
+        "2026-08-09T14:00:00Z",
+    )
+    canonical_lineage = json.loads(
+        (canonical.root / "lineage/LINEAGE.json").read_text()
+    )
+    canonical_manifest = json.loads((canonical.root / "MANIFEST.json").read_text())
+
+    assert canonical_lineage["parent_ids"] == ["generation-3"]
+    assert canonical_lineage["root_package_ids"] == ["generation-1"]
+    assert canonical_manifest["lineage_roots"] == ["generation-1"]
+    assert validate_package(canonical.root).valid
 
 
 @pytest.mark.parametrize(
