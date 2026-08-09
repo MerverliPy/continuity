@@ -328,6 +328,32 @@ def test_verified_label_cannot_override_expected_observed_hash_mismatch() -> Non
     assert report.selected_claim_ids == ()
 
 
+@pytest.mark.parametrize(
+    ("expected_sha256", "observed_sha256"),
+    (("a" * 64, None), (None, "a" * 64)),
+)
+def test_incomplete_digest_pair_cannot_control_selection(
+    expected_sha256: str | None,
+    observed_sha256: str | None,
+) -> None:
+    """Catches one-sided digest evidence passing the shared integrity gate."""
+    claim = _claim("claim-incomplete-digest", "behavior", "deploy", "source")
+    finding = _integrity(
+        "integrity-incomplete-digest",
+        "source",
+        EvidenceState.VERIFIED,
+        structurally_valid=True,
+        lineage_valid=True,
+        expected_sha256=expected_sha256,
+        observed_sha256=observed_sha256,
+    )
+
+    report = reconcile_sources((claim,), (), (finding,))
+
+    assert finding.permits_automatic_selection is False
+    assert report.selected_claim_ids == ()
+
+
 def test_global_invalid_integrity_is_combined_with_source_verified_finding() -> None:
     """Catches source-specific evidence replacing a controlling global failure."""
     claim = _claim("claim-source", "behavior", "retry", "source")

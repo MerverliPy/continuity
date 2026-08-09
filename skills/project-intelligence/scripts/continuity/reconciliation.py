@@ -82,16 +82,28 @@ def integrity_finding_permits_automatic_selection(
     lineage_gate = lineage_valid is not False and (
         not lineage_required or lineage_valid is True
     )
-    digest_gate = not (
-        expected_sha256 is not None
-        and observed_sha256 is not None
-        and expected_sha256 != observed_sha256
+    digest_gate = integrity_digest_is_coherent(
+        expected_sha256,
+        observed_sha256,
     )
     return (
         evidence_state is EvidenceState.VERIFIED
         and structural_gate
         and lineage_gate
         and digest_gate
+    )
+
+
+def integrity_digest_is_coherent(
+    expected_sha256: str | None,
+    observed_sha256: str | None,
+) -> bool:
+    """Require a digest comparison to be absent or complete and equal."""
+
+    return (expected_sha256 is None and observed_sha256 is None) or (
+        expected_sha256 is not None
+        and observed_sha256 is not None
+        and expected_sha256 == observed_sha256
     )
 
 

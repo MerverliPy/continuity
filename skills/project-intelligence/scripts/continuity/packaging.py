@@ -81,6 +81,10 @@ _SCHEMA_PATHS = {
 }
 _TEMPLATE_ROOT = _ASSETS_ROOT / "templates"
 _TEMPLATE_TOKEN_CONTENT = re.compile(r"\s*([a-z][a-z0-9_]*)\s*")
+_THEMATIC_BREAK = re.compile(
+    r"^[ ]{0,3}(?P<marker>\*(?:[ \t]*\*){2,}|_(?:[ \t]*_){2,}|"
+    r"-(?:[ \t]*-){2,})[ \t]*$"
+)
 
 
 @dataclass(frozen=True)
@@ -1040,10 +1044,19 @@ def _markdown_list(values: Sequence[object]) -> str:
 
 def _markdown_text(value: object) -> str:
     normalized = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    thematic_markers: set[int] = set()
+    offset = 0
+    for line in normalized.split("\n"):
+        match = _THEMATIC_BREAK.fullmatch(line)
+        if match is not None:
+            thematic_markers.add(offset + match.start("marker"))
+        offset += len(line) + 1
     encoded: list[str] = []
-    for character in normalized:
+    for index, character in enumerate(normalized):
         codepoint = ord(character)
-        if character == "&":
+        if index in thematic_markers:
+            encoded.append(f"&#{codepoint};")
+        elif character == "&":
             encoded.append("&amp;")
         elif character == "<":
             encoded.append("&lt;")

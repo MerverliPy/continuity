@@ -144,6 +144,33 @@ def test_preflight_record_serializes_the_exact_v1_contract() -> None:
 
 
 @pytest.mark.parametrize(
+    ("expected_sha256", "observed_sha256"),
+    (("a" * 64, None), (None, "a" * 64)),
+)
+def test_incomplete_digest_pair_blocks_readiness(
+    expected_sha256: str | None,
+    observed_sha256: str | None,
+) -> None:
+    """Catches one-sided expected/observed evidence producing Ready authority."""
+    finding = IntegrityFinding(
+        "integrity-incomplete-digest",
+        "canonical-package",
+        EvidenceState.VERIFIED,
+        source_ref="canonical/SHA256SUMS.txt#integrity-incomplete-digest",
+        structurally_valid=True,
+        lineage_valid=True,
+        expected_sha256=expected_sha256,
+        observed_sha256=observed_sha256,
+    )
+
+    decision = classify_readiness(_report(integrity=(finding,)), "implementation")
+
+    assert decision.status is ReadinessStatus.BLOCKED
+    assert decision.authorized_actions == ()
+    assert any("incomplete digest pair" in reason for reason in decision.reasons)
+
+
+@pytest.mark.parametrize(
     ("report", "expected"),
     (
         (_report(), ReadinessStatus.READY),

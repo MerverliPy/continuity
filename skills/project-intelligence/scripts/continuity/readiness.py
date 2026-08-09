@@ -4,7 +4,7 @@ from collections.abc import Iterable, Mapping
 import json
 
 from .models import EvidenceState, PreflightDecision, ReadinessStatus
-from .reconciliation import ReconciliationReport
+from .reconciliation import ReconciliationReport, integrity_digest_is_coherent
 
 
 _PROJECT_FIELDS = frozenset(
@@ -86,12 +86,18 @@ def classify_readiness(
     if not report.findings:
         block("integrity gate: no integrity findings were supplied")
     for finding in report.findings:
-        if (
-            finding.expected_sha256 is not None
-            and finding.observed_sha256 is not None
-            and finding.expected_sha256 != finding.observed_sha256
+        if not integrity_digest_is_coherent(
+            finding.expected_sha256,
+            finding.observed_sha256,
         ):
-            block(f"integrity gate: hash mismatch in {finding.finding_id}")
+            if (finding.expected_sha256 is None) != (
+                finding.observed_sha256 is None
+            ):
+                block(
+                    f"integrity gate: incomplete digest pair in {finding.finding_id}"
+                )
+            else:
+                block(f"integrity gate: hash mismatch in {finding.finding_id}")
         elif finding.evidence_state is EvidenceState.MISSING and "manifest" in _normalize(
             finding.detail
         ):

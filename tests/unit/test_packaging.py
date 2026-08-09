@@ -602,6 +602,121 @@ def test_unresolved_includes_verified_integrity_hash_mismatch(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
+    ("expected_sha256", "observed_sha256"),
+    (("a" * 64, None), (None, "a" * 64)),
+)
+def test_incomplete_digest_pair_blocks_package_and_appears_in_unresolved(
+    tmp_path: Path,
+    expected_sha256: str | None,
+    observed_sha256: str | None,
+) -> None:
+    """Catches checksum-valid packages hiding a one-sided digest comparison."""
+    report = _report()
+    finding = IntegrityFinding(
+        "finding-incomplete-digest",
+        "source-tree",
+        EvidenceState.VERIFIED,
+        source_ref="source/SHA256SUMS.txt#src/app.py",
+        detail="digest comparison is incomplete",
+        structurally_valid=True,
+        lineage_valid=True,
+        expected_sha256=expected_sha256,
+        observed_sha256=observed_sha256,
+    )
+    report = ReconciliationReport(
+        claims=report.claims,
+        approvals=report.approvals,
+        findings=(finding,),
+        conflicts=report.conflicts,
+        selected_claim_ids=report.selected_claim_ids,
+        notes=report.notes,
+    )
+    readiness = classify_readiness(report, "implementation").status
+
+    result = build_candidate(_request(tmp_path, report=report, readiness=readiness))
+    manifest = json.loads((result.root / "MANIFEST.json").read_text(encoding="utf-8"))
+    unresolved = (result.root / "UNRESOLVED.md").read_text(encoding="utf-8")
+
+    assert manifest["readiness"] == "Blocked"
+    row = next(line for line in unresolved.splitlines() if finding.finding_id in line)
+    assert finding.source_ref in row
+    assert validate_package(result.root).valid
+
+
+@pytest.mark.parametrize(
+    "thematic_break",
+    ("***", "___", "_ _ _", "* * *", "- - -", "-\t- -"),
+)
+def test_supplemental_thematic_breaks_are_neutralized(
+    tmp_path: Path,
+    thematic_break: str,
+) -> None:
+    """Catches caller narrative opening an active CommonMark thematic break."""
+    request = _request(tmp_path)
+    narratives = {
+        **request.rendered_documents,
+        "HANDOFF_README.md": f"before\n{thematic_break}\nafter\n",
+    }
+    request = CandidateBuildRequest(
+        **{**request.__dict__, "rendered_documents": narratives}
+    )
+
+    result = build_candidate(request)
+    handoff = (result.root / "HANDOFF_README.md").read_text(encoding="utf-8")
+
+    assert f"\n> {thematic_break}\n" not in handoff
+    assert validate_package(result.root).valid
+
+
+def test_structured_thematic_breaks_are_neutralized(tmp_path: Path) -> None:
+    """Catches selected structured values retaining raw thematic-break grammar."""
+    report = _report()
+    breaks = ("***", "___", "_ _ _", "* * *", "- - -", "-\t- -")
+    hostile_claims = tuple(
+        ClaimRecord(
+            f"claim-thematic-{index}",
+            thematic_break,
+            "safe value",
+            "source-tree",
+            f"source/claim-{index}.json\n{thematic_break}",
+            EvidenceState.VERIFIED,
+        )
+        for index, thematic_break in enumerate(breaks)
+    )
+    report = ReconciliationReport(
+        claims=(*report.claims, *hostile_claims),
+        approvals=report.approvals,
+        findings=report.findings,
+        conflicts=report.conflicts,
+        selected_claim_ids=(
+            *report.selected_claim_ids,
+            *(claim.claim_id for claim in hostile_claims),
+        ),
+        notes=report.notes,
+    )
+
+    result = build_candidate(_request(tmp_path, report=report))
+    canonical = (result.root / "CANONICAL_STATE.md").read_text(encoding="utf-8")
+    reconciliation = json.loads(
+        (result.root / "receipts/RECONCILIATION.json").read_text(encoding="utf-8")
+    )
+
+    for thematic_break in breaks:
+        assert f"| {thematic_break} |" not in canonical
+        assert f"&#10;{thematic_break}" not in canonical
+    source_refs = {
+        claim["source_ref"]
+        for claim in reconciliation["claims"]
+        if claim["claim_id"].startswith("claim-thematic-")
+    }
+    assert source_refs == {
+        f"source/claim-{index}.json\n{thematic_break}"
+        for index, thematic_break in enumerate(breaks)
+    }
+    assert validate_package(result.root).valid
+
+
+@pytest.mark.parametrize(
     ("document", "governing_fragment"),
     (
         ("HANDOFF_README.md", "- Package ID: `candidate-alpha`"),
