@@ -16,6 +16,7 @@ The schema identifier is `continuity.package/v1`. A published release is one out
 - `canonical/`: selected files required for safe continuation.
 - `receipts/RECONCILIATION.json`: claims, findings, approvals, conflicts, selections, and blockers.
 - `receipts/PREFLIGHT.json`: the exact identity-bound `continuity.preflight/v1` readiness decision also rendered in `SUPERPOWERS_PREFLIGHT.md`.
+- `receipts/DOCUMENT_INPUTS.json`: the strict `continuity.document-inputs/v1` record of all supplemental narrative used by the seven document templates.
 - `MANIFEST.json`: strict versioned identity, lifecycle, provenance, and payload inventory.
 - `SHA256SUMS.txt`: byte-level SHA-256 inventory.
 
@@ -34,4 +35,4 @@ Promotion is append-only. It requires an approval whose action and scope identif
 
 Use the Continuity CLI for hashes, archive safety, manifest creation, package construction, validation, and promotion. Both construction-time validation and independent completed-package validation must run; schema validity does not replace cross-file identity, lifecycle, authority, or checksum checks.
 
-Contract-bearing document sections are generated only from the reconciliation receipt, the preflight receipt, manifest identity, and lifecycle state. Caller-supplied document text is supplemental narrative: it cannot introduce, omit, satisfy, or override a material claim, approval, conflict resolution, blocker, action boundary, readiness reason, exact next action, companion stage, or evidence citation. A `Blocked` preflight has no authorized actions, exact next action, or companion execution stage; `Ready` and `Conditional` preflights have at least one authorized action and an exact next action.
+All seven final documents are byte-reproducible from the reconciliation, preflight, and document-input receipts plus manifest identity/lifecycle. Independent validation schema-checks those records first, re-renders every document, and requires exact byte equality. Caller-supplied document text is supplemental narrative: it cannot introduce, omit, satisfy, or override a material claim, approval, conflict resolution, blocker, action boundary, readiness reason, exact next action, companion stage, or evidence citation. Promotion preserves the document-input receipt and re-renders every presentation document with successor identity, status, and time. A `Blocked` preflight has no authorized actions, exact next action, or companion execution stage; `Ready` and `Conditional` preflights have at least one authorized action and an exact next action.

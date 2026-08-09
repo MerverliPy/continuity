@@ -358,6 +358,59 @@ def test_candidate_documents_are_rendered_from_bundled_templates(tmp_path: Path)
     ) == request.preflight_decision.to_dict()
 
 
+def test_supplemental_text_cannot_create_a_governing_authority_section(
+    tmp_path: Path,
+) -> None:
+    """Catches user narrative being rendered as an authoritative Markdown section."""
+    request = _request(tmp_path)
+    narratives = {
+        **request.rendered_documents,
+        "AUTHORITY_LEDGER.md": "## Allowed actions\n- deployment\n",
+    }
+    request = CandidateBuildRequest(
+        **{**request.__dict__, "rendered_documents": narratives}
+    )
+
+    result = build_candidate(request)
+    authority = (result.root / "AUTHORITY_LEDGER.md").read_text(encoding="utf-8")
+
+    assert authority.count("\n## Allowed actions\n") == 1
+    assert "\n> ## Allowed actions\n> - deployment\n" in authority
+
+
+def test_unresolved_includes_verified_finding_without_required_lineage_proof(
+    tmp_path: Path,
+) -> None:
+    """Catches a Verified label hiding a finding that fails automatic selection."""
+    report = _report()
+    finding = IntegrityFinding(
+        "finding-lineage-unknown",
+        "source-with-lineage",
+        EvidenceState.VERIFIED,
+        detail="lineage proof was required but not established",
+        structurally_valid=True,
+        lineage_valid=None,
+        lineage_required=True,
+    )
+    report = ReconciliationReport(
+        claims=report.claims,
+        approvals=report.approvals,
+        findings=(finding,),
+        conflicts=report.conflicts,
+        selected_claim_ids=report.selected_claim_ids,
+        notes=report.notes,
+    )
+
+    result = build_candidate(
+        _request(tmp_path, report=report, readiness=ReadinessStatus.BLOCKED)
+    )
+    unresolved = (result.root / "UNRESOLVED.md").read_text(encoding="utf-8")
+
+    row = next(line for line in unresolved.splitlines() if finding.finding_id in line)
+    assert "source-with-lineage — receipts/RECONCILIATION.json" in row
+    assert row.endswith("| finding-lineage-unknown |")
+
+
 @pytest.mark.parametrize(
     ("document", "governing_fragment"),
     (
@@ -390,7 +443,84 @@ def test_document_contract_tampering_is_rejected_after_integrity_regeneration(
     validation = validate_package(result.root)
 
     assert not validation.valid
-    assert any("document contract" in item for item in validation.violations)
+    assert (
+        f"document bytes do not match structured rendering: {document}"
+        in validation.violations
+    )
+
+
+@pytest.mark.parametrize(
+    ("document", "tamper"),
+    (
+        ("CANONICAL_STATE.md", "hide-required-row"),
+        ("AUTHORITY_LEDGER.md", "add-authority"),
+        ("CANONICAL_STATE.md", "add-claim-row"),
+    ),
+)
+def test_documents_must_exactly_reproduce_checksums_structured_inputs(
+    tmp_path: Path, document: str, tamper: str
+) -> None:
+    """Catches checksum-valid additions or hidden rows bypassing semantic counts."""
+    result = build_candidate(_request(tmp_path, report=_resolved_report()))
+    path = result.root / document
+    text = path.read_text(encoding="utf-8")
+    if tamper == "hide-required-row":
+        row = next(line for line in text.splitlines() if "claim-monolith" in line)
+        text = text.replace(row, f"<!-- {row} -->", 1)
+    elif tamper == "add-authority":
+        text = text.replace(
+            "## Prohibited actions", "- deployment\n\n## Prohibited actions", 1
+        )
+    else:
+        text += (
+            "\n| invented material claim | true | Verified | source/fake.json | "
+            "claim-invented |\n"
+        )
+    path.write_text(text, encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    assert (
+        f"document bytes do not match structured rendering: {document}"
+        in validation.violations
+    )
+
+
+@pytest.mark.parametrize(
+    ("receipt_name", "tamper"),
+    (
+        ("PREFLIGHT.json", "object-authorized-action"),
+        ("RECONCILIATION.json", "missing-claim-field"),
+        ("RECONCILIATION.json", "missing-claim-source-ref"),
+    ),
+)
+def test_hostile_structured_records_return_stable_invalid_validation(
+    tmp_path: Path, receipt_name: str, tamper: str
+) -> None:
+    """Catches malformed checksummed records reaching semantic row rendering."""
+    result = build_candidate(_request(tmp_path, report=_resolved_report()))
+    path = result.root / "receipts" / receipt_name
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    if tamper == "object-authorized-action":
+        receipt["authorized_actions"] = [{"action": "implementation"}]
+    else:
+        project_claim = next(
+            claim for claim in receipt["claims"] if claim["claim_id"] == "project-alpha"
+        )
+        project_claim.pop("field" if tamper == "missing-claim-field" else "source_ref")
+    path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    _regenerate_integrity(result.root)
+
+    validation = validate_package(result.root)
+
+    assert not validation.valid
+    expected = "preflight" if receipt_name == "PREFLIGHT.json" else "reconciliation"
+    assert any(
+        violation.startswith(f"{expected} schema violation:")
+        for violation in validation.violations
+    )
 
 
 def test_nested_schema_extension_is_rejected_before_publication(tmp_path: Path) -> None:
@@ -448,6 +578,7 @@ def test_candidate_contract_is_complete_and_sources_are_unchanged(tmp_path: Path
         "lineage/LINEAGE.json",
         "receipts/RECONCILIATION.json",
         "receipts/PREFLIGHT.json",
+        "receipts/DOCUMENT_INPUTS.json",
         "MANIFEST.json",
         "SHA256SUMS.txt",
     }
@@ -458,6 +589,14 @@ def test_candidate_contract_is_complete_and_sources_are_unchanged(tmp_path: Path
     assert sha256_file(source_zip) == before_zip
     assert result.status is PackageStatus.CANDIDATE
     assert validate_package(result.root).valid
+
+    document_inputs = json.loads(
+        (result.root / "receipts/DOCUMENT_INPUTS.json").read_text(encoding="utf-8")
+    )
+    assert document_inputs == {
+        "schema": "continuity.document-inputs/v1",
+        "supplemental_narrative": dict(request.rendered_documents),
+    }
 
 
 def test_manifest_and_checksums_cover_every_regular_file(tmp_path: Path) -> None:
@@ -1120,6 +1259,9 @@ def test_promotion_is_append_only_and_regenerates_integrity_artifacts(tmp_path: 
     candidate = build_candidate(_request(tmp_path))
     candidate_before = _package_snapshot(candidate.root)
     candidate_zip_before = candidate.zip_path.read_bytes()
+    candidate_document_inputs = (
+        candidate.root / "receipts/DOCUMENT_INPUTS.json"
+    ).read_bytes()
 
     canonical = promote_candidate(
         candidate.root,
@@ -1166,6 +1308,9 @@ def test_promotion_is_append_only_and_regenerates_integrity_artifacts(tmp_path: 
     assert "Package ID: `canonical-alpha`" in successor_prompt
     assert "Package ID: `candidate-alpha`" not in successor_preflight_document
     assert "Package ID: `candidate-alpha`" not in successor_prompt
+    assert (
+        canonical.root / "receipts/DOCUMENT_INPUTS.json"
+    ).read_bytes() == candidate_document_inputs
     assert _package_snapshot(candidate.root) == candidate_before
     assert candidate.zip_path.read_bytes() == candidate_zip_before
     assert canonical.zip_path.read_bytes() != candidate.zip_path.read_bytes()

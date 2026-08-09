@@ -50,6 +50,7 @@ _REQUIRED_FILES = frozenset(
         "evidence/INDEX.json",
         "receipts/RECONCILIATION.json",
         "receipts/PREFLIGHT.json",
+        "receipts/DOCUMENT_INPUTS.json",
         "MANIFEST.json",
         "SHA256SUMS.txt",
     }
@@ -71,6 +72,7 @@ _SCHEMA_PATHS = {
     "evidence": _ASSETS_ROOT / "schemas/evidence-index.schema.json",
     "reconciliation": _ASSETS_ROOT / "schemas/reconciliation.schema.json",
     "preflight": _ASSETS_ROOT / "schemas/preflight.schema.json",
+    "document-inputs": _ASSETS_ROOT / "schemas/document-inputs.schema.json",
 }
 _TEMPLATE_ROOT = _ASSETS_ROOT / "templates"
 _TEMPLATE_TOKEN_CONTENT = re.compile(r"\s*([a-z][a-z0-9_]*)\s*")
@@ -142,6 +144,7 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
         else request.readiness
     )
     rendered_documents = _render_documents(request, status, readiness)
+    document_inputs = _document_inputs(request.rendered_documents)
     workspace = Path(
         tempfile.mkdtemp(prefix=f".{output.name}.continuity-build-", dir=output.parent)
     )
@@ -172,6 +175,10 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
             package_root / "receipts/PREFLIGHT.json",
             request.preflight_decision.to_dict(),
         )
+        _write_json_new(
+            package_root / "receipts/DOCUMENT_INPUTS.json",
+            document_inputs,
+        )
         artifact_violations: list[str] = []
         _validate_json_artifacts(package_root, artifact_violations, include_manifest=False)
         if artifact_violations:
@@ -192,7 +199,8 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
         )
         artifact_violations = []
         _validate_json_artifacts(package_root, artifact_violations, include_manifest=True)
-        _validate_completed_documents(package_root, artifact_violations)
+        if not artifact_violations:
+            _validate_completed_documents(package_root, artifact_violations)
         if artifact_violations:
             raise ValueError(
                 "structured package artifacts are invalid: "
@@ -219,9 +227,20 @@ def build_candidate(request: CandidateBuildRequest) -> CandidateResult:
 
 
 def validate_package(root: Path) -> PackageValidation:
-    """Independently verify structure, lifecycle, manifest, and checksum bytes."""
+    """Independently verify a package without leaking structural exceptions."""
 
-    root = Path(root)
+    try:
+        return _validate_package(Path(root))
+    except (KeyError, TypeError, ValueError):
+        return PackageValidation(
+            False,
+            ("package structured validation failed",),
+        )
+
+
+def _validate_package(root: Path) -> PackageValidation:
+    """Verify structure, lifecycle, structured authority, and checksum bytes."""
+
     violations: list[str] = []
     manifest: dict[str, object] | None = None
     package_id: str | None = None
@@ -267,16 +286,37 @@ def validate_package(root: Path) -> PackageValidation:
         "receipts/PREFLIGHT.json",
         violations,
     )
+    document_inputs = _read_json_object(
+        root / "receipts/DOCUMENT_INPUTS.json",
+        "receipts/DOCUMENT_INPUTS.json",
+        violations,
+    )
     manifest = _read_json_object(root / "MANIFEST.json", "MANIFEST.json", violations)
+    schema_violations: list[str] = []
     for artifact, schema_name, label in (
         (lineage, "lineage", "lineage"),
         (evidence_index, "evidence", "evidence"),
         (reconciliation, "reconciliation", "reconciliation"),
         (preflight, "preflight", "preflight"),
+        (document_inputs, "document-inputs", "document inputs"),
         (manifest, "manifest", "manifest"),
     ):
         if artifact is not None:
-            _validate_against_schema(artifact, schema_name, label, violations)
+            _validate_against_schema(
+                artifact, schema_name, label, schema_violations
+            )
+    violations.extend(schema_violations)
+    structured_artifacts_are_valid = not schema_violations and all(
+        artifact is not None
+        for artifact in (
+            lineage,
+            evidence_index,
+            reconciliation,
+            preflight,
+            document_inputs,
+            manifest,
+        )
+    )
     if manifest is not None:
         package_id = _nonempty_string(manifest.get("package_id"), "manifest package_id", violations)
         project_id = _nonempty_string(
@@ -332,7 +372,11 @@ def validate_package(root: Path) -> PackageValidation:
             violations.append("preflight package_id does not match manifest")
         if preflight.get("status") != manifest.get("readiness"):
             violations.append("preflight readiness does not match manifest")
-    if reconciliation is not None and preflight is not None:
+    if (
+        structured_artifacts_are_valid
+        and reconciliation is not None
+        and preflight is not None
+    ):
         if not _serialized_preflight_matches_report(preflight, reconciliation):
             violations.append("preflight authority does not match reconciliation")
     if (
@@ -369,12 +413,19 @@ def validate_package(root: Path) -> PackageValidation:
         if promotion is not None:
             _validate_promotion_receipt(promotion, package_id, violations)
 
-    if manifest is not None and reconciliation is not None and preflight is not None:
-        _validate_document_contracts(
+    if (
+        structured_artifacts_are_valid
+        and manifest is not None
+        and reconciliation is not None
+        and preflight is not None
+        and document_inputs is not None
+    ):
+        _validate_document_reproduction(
             root,
             manifest,
             reconciliation,
             preflight,
+            document_inputs,
             violations,
         )
 
@@ -458,23 +509,23 @@ def promote_candidate(
             successor_created_at,
             validation.readiness,
         )
-        _update_successor_handoff(
-            successor_root / "HANDOFF_README.md",
-            candidate_id=validation.package_id,
-            successor_id=successor_id,
-            candidate_created_at=str(manifest["created_at"]),
-            successor_created_at=successor_created_at,
-            readiness=validation.readiness,
-        )
         _update_successor_preflight(
             successor_root / "receipts/PREFLIGHT.json",
-            successor_root / "SUPERPOWERS_PREFLIGHT.md",
-            successor_root / "NEXT_THREAD_PROMPT.txt",
             candidate_id=validation.package_id,
             successor_id=successor_id,
         )
         successor_lineage = json.loads(
             (successor_root / "lineage/LINEAGE.json").read_text(encoding="utf-8")
+        )
+        _rerender_documents_from_package(
+            successor_root,
+            {
+                "package_id": successor_id,
+                "project_id": str(manifest["project_id"]),
+                "created_at": successor_created_at,
+                "status": PackageStatus.CANONICAL.value,
+                "readiness": validation.readiness.value,
+            },
         )
         _write_manifest(
             successor_root,
@@ -491,7 +542,8 @@ def promote_candidate(
         )
         artifact_violations: list[str] = []
         _validate_json_artifacts(successor_root, artifact_violations, include_manifest=True)
-        _validate_completed_documents(successor_root, artifact_violations)
+        if not artifact_violations:
+            _validate_completed_documents(successor_root, artifact_violations)
         if artifact_violations:
             raise ValueError(
                 "promoted structured artifacts are invalid: "
@@ -606,6 +658,11 @@ def _validate_request(request: CandidateBuildRequest) -> None:
         (request.lineage_data, "lineage", "lineage"),
         (request.evidence_index, "evidence", "evidence"),
         (reconciliation, "reconciliation", "reconciliation"),
+        (
+            _document_inputs(request.rendered_documents),
+            "document-inputs",
+            "document inputs",
+        ),
     ):
         schema_violations: list[str] = []
         _validate_against_schema(artifact, schema_name, label, schema_violations)
@@ -618,69 +675,144 @@ def _render_documents(
     status: PackageStatus,
     readiness: ReadinessStatus,
 ) -> dict[str, str]:
-    report = request.approved_reconciliation_report
-    preflight = request.preflight_decision
+    identity = {
+        "package_id": request.package_id,
+        "project_id": request.project_id,
+        "created_at": request.created_at,
+        "status": status.value,
+        "readiness": readiness.value,
+    }
+    return _render_documents_from_structured_inputs(
+        identity,
+        request.approved_reconciliation_report.to_dict(),
+        request.preflight_decision.to_dict(),
+        _document_inputs(request.rendered_documents),
+    )
+
+
+def _document_inputs(narratives: Mapping[str, str]) -> dict[str, object]:
+    return {
+        "schema": "continuity.document-inputs/v1",
+        "supplemental_narrative": dict(narratives),
+    }
+
+
+def _render_documents_from_structured_inputs(
+    identity: Mapping[str, object],
+    report: Mapping[str, object],
+    preflight: Mapping[str, object],
+    document_inputs: Mapping[str, object],
+) -> dict[str, str]:
+    narratives = document_inputs["supplemental_narrative"]
+    if not isinstance(narratives, Mapping):
+        raise ValueError("document supplemental_narrative must be an object")
     claim_rows = _selected_claim_rows(report)
     approval_rows = _approval_rows(report)
     conflict_rows = _conflict_rows(report)
     unresolved_rows = _unresolved_rows(report, preflight)
+    package_id = str(identity["package_id"])
+    project_id = str(identity["project_id"])
+    created_at = str(identity["created_at"])
+    status = str(identity["status"])
+    readiness = str(identity["readiness"])
+    exact_next_action = preflight.get("exact_next_action")
+    companion = preflight.get("companion_skill_or_stage")
+    lifecycle_notice = {
+        PackageStatus.CANONICAL.value: (
+            "> Promotion record: This package is Canonical. Its Candidate predecessor "
+            "was not Canonical before exact, scoped approval."
+        ),
+        PackageStatus.BLOCKED.value: (
+            "> Current package: This package is Blocked and cannot be routed to execution."
+        ),
+    }.get(
+        status,
+        "> Current package: This Candidate is not Canonical and is not authoritative.",
+    )
     token_values = {
         "HANDOFF_README.md": {
-            "package_id": request.package_id,
-            "project_id": request.project_id,
-            "created_at": request.created_at,
-            "status": status.value,
-            "readiness": readiness.value,
-            "supplemental_narrative": request.rendered_documents["HANDOFF_README.md"],
+            "package_id": package_id,
+            "project_id": project_id,
+            "created_at": created_at,
+            "status": status,
+            "readiness": readiness,
+            "lifecycle_notice": lifecycle_notice,
+            "supplemental_narrative": _supplemental_narrative(
+                narratives["HANDOFF_README.md"]
+            ),
         },
         "CANONICAL_STATE.md": {
             "selected_claim_records": "\n".join(claim_rows),
-            "supplemental_narrative": request.rendered_documents["CANONICAL_STATE.md"],
+            "supplemental_narrative": _supplemental_narrative(
+                narratives["CANONICAL_STATE.md"]
+            ),
         },
         "AUTHORITY_LEDGER.md": {
             "approval_records": "\n".join(approval_rows),
-            "allowed_actions": _markdown_list(preflight.authorized_actions),
-            "prohibited_actions": _markdown_list(preflight.prohibited_actions),
-            "unresolved_actions": _markdown_list(preflight.unresolved_actions),
-            "supplemental_narrative": request.rendered_documents["AUTHORITY_LEDGER.md"],
+            "allowed_actions": _markdown_list(
+                _preflight_value(preflight, "authorized_actions")
+            ),
+            "prohibited_actions": _markdown_list(
+                _preflight_value(preflight, "prohibited_actions")
+            ),
+            "unresolved_actions": _markdown_list(
+                _preflight_value(preflight, "unresolved_actions")
+            ),
+            "supplemental_narrative": _supplemental_narrative(
+                narratives["AUTHORITY_LEDGER.md"]
+            ),
         },
         "CONFLICT_RESOLUTIONS.md": {
             "conflict_records": "\n".join(conflict_rows),
-            "supplemental_narrative": request.rendered_documents[
-                "CONFLICT_RESOLUTIONS.md"
-            ],
+            "supplemental_narrative": _supplemental_narrative(
+                narratives["CONFLICT_RESOLUTIONS.md"]
+            ),
         },
         "UNRESOLVED.md": {
             "unresolved_records": "\n".join(unresolved_rows),
             "unresolved_summary": _unresolved_summary(report, preflight),
-            "supplemental_narrative": request.rendered_documents["UNRESOLVED.md"],
+            "supplemental_narrative": _supplemental_narrative(
+                narratives["UNRESOLVED.md"]
+            ),
         },
         "NEXT_THREAD_PROMPT.txt": {
-            "project_id": request.project_id,
-            "package_id": request.package_id,
-            "readiness": preflight.status.value,
-            "exact_next_action": _display_optional(preflight.exact_next_action),
-            "supplemental_narrative": request.rendered_documents[
-                "NEXT_THREAD_PROMPT.txt"
-            ],
+            "project_id": project_id,
+            "package_id": package_id,
+            "readiness": readiness,
+            "exact_next_action": _display_optional(
+                exact_next_action if isinstance(exact_next_action, str) else None
+            ),
+            "supplemental_narrative": _supplemental_narrative(
+                narratives["NEXT_THREAD_PROMPT.txt"]
+            ),
         },
         "SUPERPOWERS_PREFLIGHT.md": {
-            "project_id": preflight.project_id,
-            "package_id": preflight.package_id,
-            "readiness": preflight.status.value,
-            "exact_next_action": _display_optional(preflight.exact_next_action),
-            "companion_skill_or_stage": _display_optional(
-                preflight.companion_skill_or_stage
+            "project_id": project_id,
+            "package_id": package_id,
+            "readiness": readiness,
+            "exact_next_action": _display_optional(
+                exact_next_action if isinstance(exact_next_action, str) else None
             ),
-            "reasons": _markdown_list(preflight.reasons),
-            "conditions": _markdown_list(preflight.conditions),
-            "authorized_actions": _markdown_list(preflight.authorized_actions),
-            "prohibited_actions": _markdown_list(preflight.prohibited_actions),
-            "unresolved_actions": _markdown_list(preflight.unresolved_actions),
-            "evidence_references": _markdown_list(preflight.evidence_references),
-            "supplemental_narrative": request.rendered_documents[
-                "SUPERPOWERS_PREFLIGHT.md"
-            ],
+            "companion_skill_or_stage": _display_optional(
+                companion if isinstance(companion, str) else None
+            ),
+            "reasons": _markdown_list(_preflight_value(preflight, "reasons")),
+            "conditions": _markdown_list(_preflight_value(preflight, "conditions")),
+            "authorized_actions": _markdown_list(
+                _preflight_value(preflight, "authorized_actions")
+            ),
+            "prohibited_actions": _markdown_list(
+                _preflight_value(preflight, "prohibited_actions")
+            ),
+            "unresolved_actions": _markdown_list(
+                _preflight_value(preflight, "unresolved_actions")
+            ),
+            "evidence_references": _markdown_list(
+                _preflight_value(preflight, "evidence_references")
+            ),
+            "supplemental_narrative": _supplemental_narrative(
+                narratives["SUPERPOWERS_PREFLIGHT.md"]
+            ),
         },
     }
     rendered: dict[str, str] = {}
@@ -690,6 +822,13 @@ def _render_documents(
         if not rendered[document_path].strip():
             raise ValueError(f"rendered template is empty: {document_path}")
     return rendered
+
+
+def _supplemental_narrative(value: object) -> str:
+    """Keep caller prose visibly quoted and outside governing Markdown sections."""
+
+    lines = str(value).splitlines()
+    return "\n".join(f"> {line}" if line else ">" for line in lines) or ">"
 
 
 def _selected_claim_rows(report: ReconciliationReport | Mapping[str, object]) -> list[str]:
@@ -797,18 +936,14 @@ def _unresolved_rows(
             )
         )
     for finding in _report_records(report, "findings"):
-        if (
-            finding.get("evidence_state") == EvidenceState.VERIFIED.value
-            and finding.get("structurally_valid") is not False
-            and finding.get("lineage_valid") is not False
-        ):
+        if _finding_permits_automatic_selection(finding):
             continue
         rows.append(
             _unresolved_row(
                 finding.get("detail") or "integrity finding",
                 "Blocks trusted package use",
                 finding.get("evidence_state"),
-                "receipts/RECONCILIATION.json",
+                f'{finding.get("source_id")} — receipts/RECONCILIATION.json',
                 finding.get("finding_id"),
             )
         )
@@ -839,6 +974,20 @@ def _unresolved_rows(
         "| No unresolved records | No known impact | Verified | "
         "receipts/RECONCILIATION.json | unresolved-none |"
     ]
+
+
+def _finding_permits_automatic_selection(finding: Mapping[str, object]) -> bool:
+    state_verified = finding.get("evidence_state") == EvidenceState.VERIFIED.value
+    structurally_valid = finding.get("structurally_valid")
+    structural_gate = (
+        state_verified if structurally_valid is None else structurally_valid is True
+    )
+    lineage_valid = finding.get("lineage_valid")
+    lineage_required = finding.get("lineage_required") is True
+    lineage_gate = lineage_valid is not False and (
+        not lineage_required or lineage_valid is True
+    )
+    return state_verified and structural_gate and lineage_gate
 
 
 def _unresolved_row(
@@ -1130,6 +1279,11 @@ def _validate_json_artifacts(
         ("evidence/INDEX.json", "evidence", "evidence"),
         ("receipts/RECONCILIATION.json", "reconciliation", "reconciliation"),
         ("receipts/PREFLIGHT.json", "preflight", "preflight"),
+        (
+            "receipts/DOCUMENT_INPUTS.json",
+            "document-inputs",
+            "document inputs",
+        ),
     ]
     if include_manifest:
         artifacts.append(("MANIFEST.json", "manifest", "manifest"))
@@ -1140,7 +1294,7 @@ def _validate_json_artifacts(
 
 
 def _validate_completed_documents(root: Path, violations: list[str]) -> None:
-    """Validate rendered semantics before checksums or publication are attempted."""
+    """Reproduce rendered bytes before checksums or publication are attempted."""
 
     manifest = _read_json_object(root / "MANIFEST.json", "MANIFEST.json", violations)
     reconciliation = _read_json_object(
@@ -1151,126 +1305,89 @@ def _validate_completed_documents(root: Path, violations: list[str]) -> None:
     preflight = _read_json_object(
         root / "receipts/PREFLIGHT.json", "receipts/PREFLIGHT.json", violations
     )
-    if manifest is not None and reconciliation is not None and preflight is not None:
-        _validate_document_contracts(
-            root, manifest, reconciliation, preflight, violations
+    document_inputs = _read_json_object(
+        root / "receipts/DOCUMENT_INPUTS.json",
+        "receipts/DOCUMENT_INPUTS.json",
+        violations,
+    )
+    if all(
+        artifact is not None
+        for artifact in (manifest, reconciliation, preflight, document_inputs)
+    ):
+        _validate_document_reproduction(
+            root,
+            manifest,  # type: ignore[arg-type]
+            reconciliation,  # type: ignore[arg-type]
+            preflight,  # type: ignore[arg-type]
+            document_inputs,  # type: ignore[arg-type]
+            violations,
         )
 
 
-def _validate_document_contracts(
+def _validate_document_reproduction(
     root: Path,
     manifest: Mapping[str, object],
     reconciliation: Mapping[str, object],
     preflight: Mapping[str, object],
+    document_inputs: Mapping[str, object],
     violations: list[str],
 ) -> None:
-    allowed = set(_preflight_value(preflight, "authorized_actions"))
-    prohibited = set(_preflight_value(preflight, "prohibited_actions"))
-    if allowed & prohibited:
-        violations.append("document contract has contradictory action authority")
-    if preflight.get("status") == ReadinessStatus.BLOCKED.value and allowed:
-        violations.append("document contract authorizes actions while Blocked")
-
-    exact_next = _display_optional(
-        preflight.get("exact_next_action")
-        if isinstance(preflight.get("exact_next_action"), str)
-        else None
-    )
-    companion = _display_optional(
-        preflight.get("companion_skill_or_stage")
-        if isinstance(preflight.get("companion_skill_or_stage"), str)
-        else None
-    )
-    package_id = str(manifest.get("package_id"))
-    project_id = str(manifest.get("project_id"))
-    created_at = str(manifest.get("created_at"))
-    status = str(manifest.get("status"))
-    readiness = str(manifest.get("readiness"))
-    fragments: dict[str, list[str]] = {
-        "HANDOFF_README.md": [
-            f"# Continuity handoff: {package_id}",
-            "## Package identity",
-            f"- Project ID: `{project_id}`",
-            f"- Package ID: `{package_id}`",
-            f"- Created at: `{created_at}`",
-            f"- Lifecycle status: `{status}`",
-            f"- Readiness: `{readiness}`",
-            "## Safe resume",
-            "## Supplemental narrative",
-            "## Promotion",
-        ],
-        "CANONICAL_STATE.md": [
-            "# Canonical project state",
-            "| Material claim | Value | Evidence state | Source reference | Record ID |",
-            *_selected_claim_rows(reconciliation),
-            "## Supplemental narrative",
-        ],
-        "AUTHORITY_LEDGER.md": [
-            "# Authority ledger",
-            *_approval_rows(reconciliation),
-            "## Allowed actions\n\n"
-            + _markdown_list(_preflight_value(preflight, "authorized_actions")),
-            "## Prohibited actions\n\n"
-            + _markdown_list(_preflight_value(preflight, "prohibited_actions")),
-            "## Unresolved actions\n\n"
-            + _markdown_list(_preflight_value(preflight, "unresolved_actions")),
-            "## Supplemental narrative",
-        ],
-        "CONFLICT_RESOLUTIONS.md": [
-            "# Conflict resolutions",
-            *_conflict_rows(reconciliation),
-            "## Supplemental narrative",
-        ],
-        "UNRESOLVED.md": [
-            "# Unresolved project state",
-            *_unresolved_rows(reconciliation, preflight),
-            "## Unresolved records\n\n" + _unresolved_summary(reconciliation, preflight),
-            "## Supplemental narrative",
-        ],
-        "NEXT_THREAD_PROMPT.txt": [
-            f"Project ID: `{project_id}`",
-            f"Package ID: `{package_id}`",
-            f"Readiness: `{readiness}`",
-            f"Exact next action: `{exact_next}`",
-            "Supplemental narrative:",
-        ],
-        "SUPERPOWERS_PREFLIGHT.md": [
-            "# Continuity readiness preflight",
-            "Schema: `continuity.preflight/v1`",
-            f"Project ID: `{project_id}`",
-            f"Package ID: `{package_id}`",
-            f"Readiness: `{readiness}`",
-            f"Exact next action: `{exact_next}`",
-            f"Companion skill or stage: `{companion}`",
-            "## Reasons\n\n" + _markdown_list(_preflight_value(preflight, "reasons")),
-            "## Conditions\n\n"
-            + _markdown_list(_preflight_value(preflight, "conditions")),
-            "## Authorized actions\n\n"
-            + _markdown_list(_preflight_value(preflight, "authorized_actions")),
-            "## Prohibited actions\n\n"
-            + _markdown_list(_preflight_value(preflight, "prohibited_actions")),
-            "## Unresolved actions\n\n"
-            + _markdown_list(_preflight_value(preflight, "unresolved_actions")),
-            "## Evidence references\n\n"
-            + _markdown_list(_preflight_value(preflight, "evidence_references")),
-            "## Supplemental narrative",
-        ],
+    identity = {
+        key: manifest[key]
+        for key in ("package_id", "project_id", "created_at", "status", "readiness")
     }
-    for document, expected_fragments in fragments.items():
+    expected_documents = _render_documents_from_structured_inputs(
+        identity, reconciliation, preflight, document_inputs
+    )
+    for document, expected in expected_documents.items():
         path = root / document
         if not _is_regular_file(path):
             continue
         try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            violations.append(f"document contract is unreadable: {document}")
+            observed = path.read_bytes()
+        except OSError:
+            violations.append(f"document bytes are unreadable: {document}")
             continue
-        for fragment in expected_fragments:
-            if text.count(fragment) != 1:
-                violations.append(
-                    f"document contract is missing or duplicates a governing record: {document}"
-                )
-                break
+        if observed != expected.encode("utf-8"):
+            violations.append(
+                f"document bytes do not match structured rendering: {document}"
+            )
+
+
+def _rerender_documents_from_package(
+    root: Path, identity: Mapping[str, object]
+) -> None:
+    """Replace all presentation bytes from the successor's structured records."""
+
+    violations: list[str] = []
+    reconciliation = _read_json_object(
+        root / "receipts/RECONCILIATION.json",
+        "receipts/RECONCILIATION.json",
+        violations,
+    )
+    preflight = _read_json_object(
+        root / "receipts/PREFLIGHT.json", "receipts/PREFLIGHT.json", violations
+    )
+    document_inputs = _read_json_object(
+        root / "receipts/DOCUMENT_INPUTS.json",
+        "receipts/DOCUMENT_INPUTS.json",
+        violations,
+    )
+    if violations or any(
+        artifact is None
+        for artifact in (reconciliation, preflight, document_inputs)
+    ):
+        raise ValueError("successor rendering inputs are invalid")
+    rendered = _render_documents_from_structured_inputs(
+        identity,
+        reconciliation,  # type: ignore[arg-type]
+        preflight,  # type: ignore[arg-type]
+        document_inputs,  # type: ignore[arg-type]
+    )
+    for document, text in rendered.items():
+        path = root / document
+        path.unlink()
+        _write_bytes_new(path, text.encode("utf-8"))
 
 
 def _validate_against_schema(
@@ -1773,45 +1890,8 @@ def _update_successor_lineage(
     _write_json_new(path, lineage)
 
 
-def _update_successor_handoff(
-    path: Path,
-    *,
-    candidate_id: str,
-    successor_id: str,
-    candidate_created_at: str,
-    successor_created_at: str,
-    readiness: ReadinessStatus,
-) -> None:
-    text = path.read_text(encoding="utf-8")
-    warning = (
-        "> Warning: Candidate is not Canonical. Do not treat this package as "
-        "authoritative or route it to execution before explicit, scoped promotion approval."
-    )
-    replacements = {
-        f"# Continuity handoff: {candidate_id}": f"# Continuity handoff: {successor_id}",
-        f"- Package ID: `{candidate_id}`": f"- Package ID: `{successor_id}`",
-        f"- Created at: `{candidate_created_at}`": (
-            f"- Created at: `{successor_created_at}`"
-        ),
-        "- Lifecycle status: `Candidate`": "- Lifecycle status: `Canonical`",
-        f"- Readiness: `{readiness.value}`": f"- Readiness: `{readiness.value}`",
-        warning: (
-            "> Promotion record: This package is Canonical. Its Candidate predecessor "
-            "was not Canonical before exact, scoped approval."
-        ),
-    }
-    for existing, replacement in replacements.items():
-        if text.count(existing) != 1:
-            raise ValueError("candidate handoff metadata does not match its manifest")
-        text = text.replace(existing, replacement, 1)
-    path.unlink()
-    _write_bytes_new(path, text.encode("utf-8"))
-
-
 def _update_successor_preflight(
     receipt_path: Path,
-    preflight_document: Path,
-    prompt_document: Path,
     *,
     candidate_id: str,
     successor_id: str,
@@ -1822,16 +1902,6 @@ def _update_successor_preflight(
     preflight["package_id"] = successor_id
     receipt_path.unlink()
     _write_json_new(receipt_path, preflight)
-    for path in (preflight_document, prompt_document):
-        text = path.read_text(encoding="utf-8")
-        existing = f"Package ID: `{candidate_id}`"
-        if text.count(existing) != 1:
-            raise ValueError("candidate document identity does not match its manifest")
-        path.unlink()
-        _write_bytes_new(
-            path,
-            text.replace(existing, f"Package ID: `{successor_id}`", 1).encode("utf-8"),
-        )
 
 
 def _package_sha256(root: Path) -> str:

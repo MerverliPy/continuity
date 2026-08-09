@@ -13,6 +13,7 @@ SCHEMA_NAMES = (
     "evidence-index",
     "reconciliation",
     "preflight",
+    "document-inputs",
 )
 
 
@@ -109,6 +110,18 @@ def _documents() -> dict[str, dict[str, object]]:
             "exact_next_action": "implementation",
             "companion_skill_or_stage": "superpowers:test-driven-development",
             "evidence_references": ["receipts/RECONCILIATION.json#claim-project-alpha"],
+        },
+        "document-inputs": {
+            "schema": "continuity.document-inputs/v1",
+            "supplemental_narrative": {
+                "HANDOFF_README.md": "Operator context.\n",
+                "CANONICAL_STATE.md": "State context.\n",
+                "AUTHORITY_LEDGER.md": "Authority context.\n",
+                "CONFLICT_RESOLUTIONS.md": "Conflict context.\n",
+                "UNRESOLVED.md": "Unknowns context.\n",
+                "NEXT_THREAD_PROMPT.txt": "Continuation context.\n",
+                "SUPERPOWERS_PREFLIGHT.md": "Preflight context.\n",
+            },
         },
     }
 

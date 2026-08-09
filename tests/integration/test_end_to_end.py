@@ -156,6 +156,46 @@ def _minimal_build_request(canonical_files: dict[str, str]) -> dict[str, object]
     }
 
 
+def _standalone_preflight_report() -> dict[str, object]:
+    claims = [
+        _claim("claim-project", "project_id", "alpha", "source"),
+        _claim("claim-lifecycle", "package status", "Canonical", "source"),
+        _claim("claim-action", "authorized action", "implementation", "source"),
+    ]
+    return {
+        "claims": claims,
+        "conflicts": [],
+        "findings": [
+            {
+                "finding_id": "finding-source",
+                "source_id": "source",
+                "evidence_state": "Verified",
+                "detail": "checksum and lineage verified",
+                "structurally_valid": True,
+                "lineage_valid": True,
+                "lineage_required": True,
+                "expected_sha256": "a" * 64,
+                "observed_sha256": "a" * 64,
+            }
+        ],
+        "approvals": [
+            _approval(
+                "approval-implementation",
+                "authorize-actions",
+                ["implementation"],
+                "approved",
+            )
+        ],
+        "selected_claim_ids": [
+            "claim-project",
+            "claim-lifecycle",
+            "claim-action",
+        ],
+        "blocking_conflict_ids": [],
+        "notes": [],
+    }
+
+
 def _wrap_zip(source: Path, destination: Path) -> None:
     with zipfile.ZipFile(source, "r") as input_archive, zipfile.ZipFile(
         destination, "w"
@@ -436,6 +476,76 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     assert _snapshot(older) == sources_before["older"]
     assert _snapshot(newer) == sources_before["newer"]
     assert _snapshot(candidate_release) == candidate_before
+
+
+@pytest.mark.parametrize(
+    ("case", "project_id", "expected_message"),
+    (
+        (
+            "absent",
+            "alpha",
+            "preflight requires exactly one selected project_id claim",
+        ),
+        (
+            "unselected",
+            "alpha",
+            "preflight requires exactly one selected project_id claim",
+        ),
+        (
+            "multiple",
+            "alpha",
+            "preflight requires exactly one selected project_id claim",
+        ),
+        (
+            "mismatch",
+            "beta",
+            "preflight project_id does not match selected project identity",
+        ),
+    ),
+)
+def test_standalone_preflight_binds_selected_project_identity(
+    tmp_path: Path,
+    repo_root: Path,
+    case: str,
+    project_id: str,
+    expected_message: str,
+) -> None:
+    """Catches caller project identity diverging from selected reconciliation truth."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    report = _standalone_preflight_report()
+    claims = report["claims"]
+    selected = report["selected_claim_ids"]
+    assert isinstance(claims, list) and isinstance(selected, list)
+    if case == "absent":
+        report["claims"] = [
+            claim for claim in claims if claim["claim_id"] != "claim-project"
+        ]
+        selected.remove("claim-project")
+    elif case == "unselected":
+        selected.remove("claim-project")
+    elif case == "multiple":
+        claims.append(_claim("claim-project-beta", "project id", "beta", "source"))
+        selected.append("claim-project-beta")
+    report_path = _json_file(tmp_path / f"preflight-{case}.json", report)
+
+    payload, _ = _run(
+        wrapper,
+        "preflight",
+        "--reconciliation",
+        report_path,
+        "--project-id",
+        project_id,
+        "--package-id",
+        "candidate-alpha",
+        "--requested-action",
+        "implementation",
+        "--output",
+        tmp_path / f"preflight-{case}-output.json",
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert payload["error"]["message"] == expected_message
 
 
 def test_architecture_conflict_blocks_candidate_and_implementation_recommendation(

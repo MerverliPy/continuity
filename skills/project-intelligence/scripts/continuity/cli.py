@@ -498,12 +498,14 @@ def _preflight_command(namespace: argparse.Namespace) -> _CommandResult:
     report = _parse_report(
         _read_object(Path(namespace.reconciliation), "reconciliation report")
     )
+    project_id = _required_text(namespace.project_id, "project_id")
+    _bind_preflight_project(report, project_id)
     decision = classify_readiness(
         report, _required_text(namespace.requested_action, "requested_action")
     )
     record = PreflightRecord.from_decision(
         decision,
-        _required_text(namespace.project_id, "project_id"),
+        project_id,
         _required_text(namespace.package_id, "package_id"),
     )
     violations = validate_preflight_record(record)
@@ -513,6 +515,28 @@ def _preflight_command(namespace: argparse.Namespace) -> _CommandResult:
         record.to_dict(),
         2 if decision.status is ReadinessStatus.BLOCKED else 0,
     )
+
+
+def _bind_preflight_project(report: ReconciliationReport, project_id: str) -> None:
+    selected = set(report.selected_claim_ids)
+    project_claims = tuple(
+        claim
+        for claim in report.claims
+        if claim.claim_id in selected
+        and _normalize_record_field(claim.field) == "project id"
+    )
+    if len(project_claims) != 1:
+        raise CliInputError(
+            "preflight requires exactly one selected project_id claim"
+        )
+    if project_claims[0].value != project_id:
+        raise CliInputError(
+            "preflight project_id does not match selected project identity"
+        )
+
+
+def _normalize_record_field(value: str) -> str:
+    return " ".join(value.replace("_", " ").replace("-", " ").casefold().split())
 
 
 def _parse_report(value: Mapping[str, object]) -> ReconciliationReport:

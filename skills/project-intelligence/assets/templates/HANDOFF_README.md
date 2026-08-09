@@ -1,6 +1,8 @@
 # Continuity handoff: {{ package_id }}
 
-> Warning: Candidate is not Canonical. Do not treat this package as authoritative or route it to execution before explicit, scoped promotion approval.
+> Safety rule: Candidate is not Canonical; only a separately promoted Canonical successor is authoritative.
+
+{{ lifecycle_notice }}
 
 ## Package identity
 

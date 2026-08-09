@@ -43,6 +43,7 @@ continuity/
 │   │   ├── SKILL.md
 │   │   ├── assets/
 │   │   │   ├── schemas/
+│   │   │   │   ├── document-inputs.schema.json
 │   │   │   │   ├── evidence-index.schema.json
 │   │   │   │   ├── lineage.schema.json
 │   │   │   │   ├── manifest.schema.json
@@ -212,10 +213,11 @@ continuity_cli.py reconcile --claims CLAIMS.json --approvals APPROVALS.json --in
 continuity_cli.py build --request BUILD_REQUEST.json --output-dir DIR
 continuity_cli.py validate PACKAGE_OR_ZIP --output REPORT.json
 continuity_cli.py promote CANDIDATE --approval APPROVAL.json --created-at RFC3339 --output DIR
-continuity_cli.py preflight --reconciliation REPORT.json --requested-action ACTION --output PREFLIGHT.json
+continuity_cli.py preflight --reconciliation REPORT.json --project-id PROJECT_ID --package-id PACKAGE_ID --requested-action ACTION --output PREFLIGHT.json
 ```
 
 Commands emit stable JSON to the requested output. Exit code `0` means the operation completed and its gate passed; `2` means a valid but blocked result; `1` means invalid input or an operational failure.
+Standalone preflight requires exactly one selected reconciliation claim whose normalized field is `project_id`/`project id`, and `--project-id` must equal its value. `--package-id` names the target package. The emitted `continuity.preflight/v1` object includes evidence references as well as every readiness and authority field.
 
 ---
 
@@ -775,6 +777,7 @@ git commit -m "feat: expose Continuity project-state workflow"
 - Create: `skills/project-intelligence/assets/schemas/evidence-index.schema.json`
 - Create: `skills/project-intelligence/assets/schemas/reconciliation.schema.json`
 - Create: `skills/project-intelligence/assets/schemas/preflight.schema.json`
+- Create: `skills/project-intelligence/assets/schemas/document-inputs.schema.json`
 - Create: `skills/project-intelligence/assets/templates/HANDOFF_README.md`
 - Create: `skills/project-intelligence/assets/templates/CANONICAL_STATE.md`
 - Create: `skills/project-intelligence/assets/templates/AUTHORITY_LEDGER.md`
@@ -835,7 +838,7 @@ The skills must instruct the agent to:
 
 - [ ] **Step 6: Connect package rendering to the bundled templates and validate schemas.**
 
-Package construction must load assets relative to `packaging.py`, reject malformed, unbalanced, nested, unknown, missing, or unused template tokens, and render governing sections from the approved reconciliation report and exact `PreflightRecord`. User document text is supplemental narrative only. Before checksums and publication, validate every completed document for its required headings and one entry per governing record; independent package validation repeats those semantic checks and rejects stale lifecycle identity or contradictory authority.
+Package construction must load assets relative to `packaging.py`, reject malformed, unbalanced, nested, unknown, missing, or unused template tokens, and render governing sections from the approved reconciliation report and exact `PreflightRecord`. Store every caller narrative in checksummed `receipts/DOCUMENT_INPUTS.json`; user text is supplemental only. Before checksums and publication, deterministically re-render all seven completed documents from strict structured receipts and package identity and require byte equality. Independent validation repeats exact reproduction only after schema/type checks; promotion re-renders successor bytes from the same supplemental receipt and successor identity/status/time.
 
 - [ ] **Step 7: Run contract, unit, integration, and full tests.**
 
