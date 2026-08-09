@@ -15,7 +15,7 @@ Use this skill after `project-intelligence` has selected one project and the req
 2. Perform Read-only inspection of every supplied source; preserve each observed path and do not overwrite, extract into, or normalize a source in place.
 3. Inventory accessible artifacts and record identity, provenance, integrity evidence, and unreadable or unsupported artifacts.
 4. Extract only directly supported goals, requirements, architecture, decisions, approvals, progress, safety gates, and unresolved facts.
-5. Label each material claim as `Verified`, `Asserted`, `Unresolved`, `Contradicted`, or `Missing` according to the inspected evidence.
+5. Label a claim `Verified` only with directly inspected supporting evidence and passing relevant integrity checks; otherwise label it `Asserted`, `Unresolved`, `Contradicted`, or `Missing` according to the inspected evidence.
 6. Return one inspection report with citations to source artifacts and clear limits on what was not inspected.
 7. Route competing states or claims to `reconcile-project-state`; return to `project-intelligence` when the selected scope or intended route changes.
 

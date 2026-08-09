@@ -14,8 +14,8 @@ Use this skill when inspection reports, integrity findings, lineage records, or 
 1. Confirm that every input belongs to the single project selected by `project-intelligence`.
 2. Compare source integrity, lineage, approval scope, completeness, and consistency with recorded safety gates; treat timestamps as supporting evidence only.
 3. Preserve uncontested facts with provenance and classify each difference as non-material or material.
-4. Keep every material authority conflict unresolved until a user decision identifies the exact conflict and scope.
-5. Apply only User-approved material conflict resolution records that cite the deciding source, decision, and affected scope.
+4. Keep every material conflict unresolved until a user decision identifies the exact conflict and scope.
+5. Apply a User-approved resolution for every material conflict only when its record cites the deciding source, decision, and affected scope.
 6. Produce a reconciliation report that identifies verified facts, assertions, unresolved facts, contradictions, missing evidence, conflict status, and authorized next actions.
 7. Route approved, complete reconciliation results to `create-canonical-handoff`; route a readiness-only request with a clear authority basis to `superpowers-preflight`.
 

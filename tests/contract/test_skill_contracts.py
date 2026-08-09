@@ -6,8 +6,8 @@ import pytest
 
 SKILLS = {
     "project-intelligence": "Select exactly one project before routing.",
-    "inspect-project-state": "Read-only inspection",
-    "reconcile-project-state": "User-approved material conflict resolution",
+    "inspect-project-state": "directly inspected supporting evidence and passing relevant integrity checks",
+    "reconcile-project-state": "User-approved resolution for every material conflict",
     "create-canonical-handoff": "Explicit promotion approval",
     "superpowers-preflight": "Blocked preflight",
 }
