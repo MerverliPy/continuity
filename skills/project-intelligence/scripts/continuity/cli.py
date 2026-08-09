@@ -66,7 +66,6 @@ _REPORT_FIELDS = frozenset(
         "notes",
     }
 )
-_RECONCILE_FIELDS = frozenset({"claims", "approvals", "integrity"})
 _BUILD_FIELDS = frozenset(
     {
         "package_id",
@@ -107,38 +106,37 @@ def _parser() -> argparse.ArgumentParser:
 
     inspect_command = commands.add_parser("inspect")
     inspect_command.add_argument("source")
-    inspect_command.add_argument("--source-id", required=True)
-    inspect_command.add_argument("--output", required=True)
+    inspect_command.add_argument("--output", dest="json_output", required=True)
     inspect_command.set_defaults(handler=_inspect_command)
 
     reconcile_command = commands.add_parser("reconcile")
-    reconcile_command.add_argument("input")
-    reconcile_command.add_argument("--output", required=True)
+    reconcile_command.add_argument("--claims", required=True)
+    reconcile_command.add_argument("--approvals", required=True)
+    reconcile_command.add_argument("--integrity", required=True)
+    reconcile_command.add_argument("--output", dest="json_output", required=True)
     reconcile_command.set_defaults(handler=_reconcile_command)
 
     build_command = commands.add_parser("build")
-    build_command.add_argument("input")
-    build_command.add_argument("--release", required=True)
-    build_command.add_argument("--output", required=True)
+    build_command.add_argument("--request", required=True)
+    build_command.add_argument("--output-dir", required=True)
     build_command.set_defaults(handler=_build_command)
 
     validate_command = commands.add_parser("validate")
     validate_command.add_argument("package")
-    validate_command.add_argument("--output", required=True)
+    validate_command.add_argument("--output", dest="json_output", required=True)
     validate_command.set_defaults(handler=_validate_command)
 
     promote_command = commands.add_parser("promote")
     promote_command.add_argument("candidate")
-    promote_command.add_argument("--release", required=True)
     promote_command.add_argument("--approval")
     promote_command.add_argument("--created-at", required=True)
     promote_command.add_argument("--output", required=True)
     promote_command.set_defaults(handler=_promote_command)
 
     preflight_command = commands.add_parser("preflight")
-    preflight_command.add_argument("input")
-    preflight_command.add_argument("--action", required=True)
-    preflight_command.add_argument("--output", required=True)
+    preflight_command.add_argument("--reconciliation", required=True)
+    preflight_command.add_argument("--requested-action", required=True)
+    preflight_command.add_argument("--output", dest="json_output", required=True)
     preflight_command.set_defaults(handler=_preflight_command)
     return parser
 
@@ -147,19 +145,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run one CLI operation, emitting exactly one stable JSON document."""
 
     arguments = list(sys.argv[1:] if argv is None else argv)
-    output = _output_argument(arguments)
+    output: Path | None = None
     try:
         namespace = _parser().parse_args(arguments)
-        output = Path(namespace.output)
+        output = _validated_json_output(namespace)
         handler: Callable[[argparse.Namespace], _CommandResult] = namespace.handler
         result = handler(namespace)
-        _emit(result.payload, output)
+        if output is None:
+            _emit_stdout(result.payload)
+        else:
+            _emit(result.payload, output)
         return result.exit_code
     except CliInputError as error:
         payload = _error(str(error))
         _emit_best_effort(payload, output)
         return 1
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+    except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         payload = _error("operation failed validation or could not be completed")
         _emit_best_effort(payload, output)
         return 1
@@ -167,7 +168,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _inspect_command(namespace: argparse.Namespace) -> _CommandResult:
     source = Path(namespace.source)
-    source_id = _required_text(namespace.source_id, "source_id")
+    source_id = _required_text(
+        source.stem if source.suffix.casefold() == ".zip" else source.name,
+        "source_id",
+    )
     try:
         mode = source.lstat().st_mode
     except OSError as error:
@@ -235,21 +239,44 @@ def _inspect_archive(source: Path, source_id: str) -> _CommandResult:
     paths = {entry.normalized_path for entry in inspection.entries}
     manifest_present = "MANIFEST.json" in paths
     checksum_present = "SHA256SUMS.txt" in paths
-    if inspection.safe and manifest_present and checksum_present:
-        state = EvidenceState.VERIFIED
-        detail = "archive safety and required integrity entries verified"
-    elif inspection.safe:
-        state = EvidenceState.MISSING
-        detail = "required manifest or checksum inventory is missing"
-    else:
+    categories: tuple[str, ...]
+    if not inspection.safe:
         state = EvidenceState.CONTRADICTED
-        detail = "archive safety validation failed"
+        code = "archive-safety-failed"
+        categories = _validation_categories(inspection.violations)
+        violation_count = len(inspection.violations)
+    elif manifest_present and checksum_present:
+        with tempfile.TemporaryDirectory(prefix="continuity-inspect-") as temporary:
+            extracted = Path(temporary) / "package"
+            extracted_inspection = safe_extract_zip(source, extracted)
+            if not extracted_inspection.safe:
+                state = EvidenceState.CONTRADICTED
+                code = "archive-safety-failed"
+                categories = _validation_categories(extracted_inspection.violations)
+                violation_count = len(extracted_inspection.violations)
+            else:
+                validation = validate_package(_package_root(extracted))
+                if validation.valid:
+                    state = EvidenceState.VERIFIED
+                    code = "package-verified"
+                    categories = ()
+                    violation_count = 0
+                else:
+                    state = EvidenceState.CONTRADICTED
+                    code = "package-validation-failed"
+                    categories = _validation_categories(validation.violations)
+                    violation_count = len(validation.violations)
+    else:
+        state = EvidenceState.UNRESOLVED
+        code = "package-integrity-evidence-incomplete"
+        categories = ("missing-package-integrity",)
+        violation_count = 1
     integrity = IntegrityFinding(
         finding_id=_finding_id(source_id),
         source_id=source_id,
         evidence_state=state,
-        detail=detail,
-        structurally_valid=inspection.safe and manifest_present and checksum_present,
+        detail=code,
+        structurally_valid=state is EvidenceState.VERIFIED,
         lineage_valid=None,
         lineage_required=False,
     )
@@ -258,32 +285,34 @@ def _inspect_archive(source: Path, source_id: str) -> _CommandResult:
             "ok": True,
             "operation": "inspect",
             "source": {"kind": "zip", "sha256": sha256_file(source), "source_id": source_id},
-            "artifacts": [
-                {
-                    "compressed_size": entry.compressed_size,
-                    "is_directory": entry.is_directory,
-                    "normalized_path": entry.normalized_path,
-                    "observed_path": entry.observed_path,
-                    "uncompressed_size": entry.uncompressed_size,
-                }
-                for entry in inspection.entries
-            ],
-            "archive": {"safe": inspection.safe, "violations": list(inspection.violations)},
+            "artifacts": {
+                "directory_count": sum(entry.is_directory for entry in inspection.entries),
+                "entry_count": len(inspection.entries),
+                "file_count": sum(not entry.is_directory for entry in inspection.entries),
+            },
+            "archive": {
+                "categories": list(categories),
+                "code": code,
+                "safe": inspection.safe,
+                "violation_count": violation_count,
+            },
             "integrity": integrity.to_dict(),
         }
     )
 
 
 def _reconcile_command(namespace: argparse.Namespace) -> _CommandResult:
-    value = _read_object(Path(namespace.input), "reconciliation input")
-    _exact_fields(value, _RECONCILE_FIELDS, "reconciliation input")
-    claims = tuple(_parse_claim(item) for item in _object_sequence(value.get("claims"), "claims"))
+    claims = tuple(
+        _parse_claim(item)
+        for item in _read_object_list(Path(namespace.claims), "claims")
+    )
     approvals = tuple(
-        _parse_approval(item) for item in _object_sequence(value.get("approvals"), "approvals")
+        _parse_approval(item)
+        for item in _read_object_list(Path(namespace.approvals), "approvals")
     )
     integrity = tuple(
         _parse_integrity(item)
-        for item in _object_sequence(value.get("integrity"), "integrity")
+        for item in _read_object_list(Path(namespace.integrity), "integrity")
     )
     report = reconcile_sources(claims, approvals, integrity)
     blocked = bool(report.blocking_conflicts)
@@ -294,7 +323,7 @@ def _reconcile_command(namespace: argparse.Namespace) -> _CommandResult:
 
 
 def _build_command(namespace: argparse.Namespace) -> _CommandResult:
-    value = _read_object(Path(namespace.input), "build input")
+    value = _read_object(Path(namespace.request), "build input")
     _exact_fields(value, _BUILD_FIELDS, "build input")
     source_hashes = _string_mapping(value.get("selected_source_hashes"), "selected_source_hashes")
     canonical_files = _string_mapping(value.get("canonical_files"), "canonical_files")
@@ -306,6 +335,9 @@ def _build_command(namespace: argparse.Namespace) -> _CommandResult:
         for item in _object_sequence(
             value.get("secure_handling_approvals"), "secure_handling_approvals"
         )
+    )
+    _validate_build_output(
+        Path(namespace.output_dir), tuple(Path(source) for source in canonical_files.values())
     )
     request = CandidateBuildRequest(
         package_id=_required_text(value.get("package_id"), "package_id"),
@@ -320,7 +352,7 @@ def _build_command(namespace: argparse.Namespace) -> _CommandResult:
         lineage_data=lineage,
         evidence_index=evidence,
         secure_handling_approvals=approvals,
-        output=Path(namespace.release),
+        output=Path(namespace.output_dir),
         readiness=_enum(ReadinessStatus, value.get("readiness"), "readiness"),
         allow_conditional_promotion=_boolean(
             value.get("allow_conditional_promotion"), "allow_conditional_promotion"
@@ -376,6 +408,7 @@ def _validation_result(
     status: PackageStatus | None = None,
     readiness: ReadinessStatus | None = None,
 ) -> _CommandResult:
+    categories = _validation_categories(violations)
     payload = {
         "ok": valid,
         "operation": "validate",
@@ -384,11 +417,31 @@ def _validation_result(
             "readiness": readiness.value if readiness is not None else None,
             "status": status.value if status is not None else None,
             "valid": valid,
-            "violations": list(violations),
+            "violation_count": len(violations),
+            "violations": list(categories),
         },
     }
     exit_code = 0 if valid and status is not PackageStatus.BLOCKED else 2 if valid else 1
     return _CommandResult(payload, exit_code)
+
+
+def _validation_categories(violations: Sequence[str]) -> tuple[str, ...]:
+    categories: set[str] = set()
+    for violation in violations:
+        normalized = violation.casefold()
+        if any(term in normalized for term in ("checksum", "digest", "sha256", "manifest")):
+            categories.add("package-integrity")
+        elif any(term in normalized for term in ("claim", "approval", "reconciliation", "authority")):
+            categories.add("package-authority")
+        elif any(term in normalized for term in ("status", "readiness", "lifecycle", "promotion")):
+            categories.add("package-lifecycle")
+        elif any(term in normalized for term in ("json", "schema", "lineage", "evidence")):
+            categories.add("package-metadata")
+        elif any(term in normalized for term in ("archive", "zip", "path", "entry", "symlink")):
+            categories.add("archive-safety")
+        else:
+            categories.add("package-structure")
+    return tuple(sorted(categories))
 
 
 def _promote_command(namespace: argparse.Namespace) -> _CommandResult:
@@ -396,9 +449,10 @@ def _promote_command(namespace: argparse.Namespace) -> _CommandResult:
         raise CliInputError("promotion requires an exact approval record")
     approval = _parse_approval(_read_object(Path(namespace.approval), "approval record"))
     candidate = _package_root(Path(namespace.candidate))
+    _validate_promotion_output(Path(namespace.output), Path(namespace.candidate), candidate)
     result = promote_candidate(
         candidate,
-        Path(namespace.release),
+        Path(namespace.output),
         approval,
         _required_text(namespace.created_at, "created_at"),
     )
@@ -416,8 +470,12 @@ def _promote_command(namespace: argparse.Namespace) -> _CommandResult:
 
 
 def _preflight_command(namespace: argparse.Namespace) -> _CommandResult:
-    report = _parse_report(_read_object(Path(namespace.input), "reconciliation report"))
-    decision = classify_readiness(report, _required_text(namespace.action, "action"))
+    report = _parse_report(
+        _read_object(Path(namespace.reconciliation), "reconciliation report")
+    )
+    decision = classify_readiness(
+        report, _required_text(namespace.requested_action, "requested_action")
+    )
     payload = {
         "ok": True,
         "operation": "preflight",
@@ -534,6 +592,21 @@ def _read_object(path: Path, label: str) -> dict[str, object]:
     return value
 
 
+def _read_object_list(path: Path, label: str) -> tuple[dict[str, object], ...]:
+    try:
+        mode = path.lstat().st_mode
+        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+            raise CliInputError(f"{label} must be a regular JSON file")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except CliInputError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CliInputError(f"{label} could not be read as JSON") from error
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise CliInputError(f"{label} must be a JSON list of objects")
+    return tuple(value)
+
+
 def _exact_fields(value: Mapping[str, object], expected: frozenset[str], label: str) -> None:
     fields = set(value)
     if fields != expected:
@@ -645,6 +718,85 @@ def _finding_id(source_id: str) -> str:
     return f"integrity-{digest}"
 
 
+def _validated_json_output(namespace: argparse.Namespace) -> Path | None:
+    value = getattr(namespace, "json_output", None)
+    if value is None:
+        return None
+    output = Path(value)
+    operation = namespace.operation
+    if operation == "inspect":
+        inputs = (Path(namespace.source),)
+    elif operation == "reconcile":
+        inputs = (
+            Path(namespace.claims),
+            Path(namespace.approvals),
+            Path(namespace.integrity),
+        )
+    elif operation == "validate":
+        inputs = (Path(namespace.package),)
+    else:
+        inputs = (Path(namespace.reconciliation),)
+    _validate_write_destination(output)
+    output_path = _resolved_path(output)
+    for input_path in inputs:
+        protected = _resolved_path(input_path)
+        if output_path == protected or (
+            input_path.is_dir() and _is_within(output_path, protected)
+        ):
+            raise CliInputError("output overlaps read-only input evidence")
+    return output
+
+
+def _validate_build_output(output: Path, canonical_sources: Sequence[Path]) -> None:
+    _validate_write_destination(output)
+    output_path = _resolved_path(output)
+    for source in canonical_sources:
+        source_path = _resolved_path(source)
+        if _paths_overlap(output_path, source_path):
+            raise CliInputError("release output overlaps canonical source evidence")
+
+
+def _validate_promotion_output(output: Path, candidate: Path, package_root: Path) -> None:
+    _validate_write_destination(output)
+    output_path = _resolved_path(output)
+    protected = {_resolved_path(candidate), _resolved_path(package_root)}
+    if package_root.name == "package":
+        protected.add(_resolved_path(package_root.parent))
+    if any(output_path == path or _is_within(output_path, path) for path in protected):
+        raise CliInputError("promotion output overlaps candidate evidence")
+
+
+def _validate_write_destination(output: Path) -> None:
+    absolute = Path(os.path.abspath(output))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise CliInputError("output path may not traverse a symlink")
+    if not output.parent.is_dir():
+        raise CliInputError("output parent does not exist")
+
+
+def _resolved_path(path: Path) -> Path:
+    return path.resolve(strict=False)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or _is_within(left, right) or _is_within(right, left)
+
+
 def _error(message: str) -> dict[str, object]:
     return {
         "ok": False,
@@ -652,19 +804,14 @@ def _error(message: str) -> dict[str, object]:
     }
 
 
-def _output_argument(arguments: Sequence[str]) -> Path | None:
-    try:
-        index = len(arguments) - 1 - list(reversed(arguments)).index("--output")
-    except ValueError:
-        return None
-    if index + 1 >= len(arguments):
-        return None
-    return Path(arguments[index + 1])
-
-
 def _emit(payload: Mapping[str, object], output: Path) -> None:
     rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     _atomic_write(output, rendered)
+    sys.stdout.write(rendered)
+
+
+def _emit_stdout(payload: Mapping[str, object]) -> None:
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     sys.stdout.write(rendered)
 
 

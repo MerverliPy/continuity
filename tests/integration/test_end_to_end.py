@@ -7,6 +7,9 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
+
+import pytest
 
 
 DOCUMENT_PATHS = (
@@ -119,8 +122,8 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
 ) -> None:
     """Catches any verb bypassing gates or mutating inspected/promoted inputs."""
     wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
-    older = tmp_path / "older-handoff"
-    newer = tmp_path / "newer-handoff"
+    older = tmp_path / "older"
+    newer = tmp_path / "newer"
     _complete_handoff(older)
     _complete_handoff(newer)
     (newer / "app.py").write_text(
@@ -141,8 +144,6 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
             wrapper,
             "inspect",
             source,
-            "--source-id",
-            source_id,
             "--output",
             output,
             expected=0,
@@ -162,22 +163,25 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     approvals = [
         _approval("approval-implementation", "authorize-actions", ["implementation"], "approved")
     ]
-    reconcile_input = _json_file(
-        tmp_path / "reconcile-input.json",
-        {
-            "claims": claims,
-            "approvals": approvals,
-            "integrity": [
-                inspect_results["older"]["integrity"],
-                inspect_results["newer"]["integrity"],
-            ],
-        },
+    claims_input = _json_file(tmp_path / "claims.json", claims)
+    approvals_input = _json_file(tmp_path / "approvals.json", approvals)
+    integrity_input = _json_file(
+        tmp_path / "integrity.json",
+        [
+            inspect_results["older"]["integrity"],
+            inspect_results["newer"]["integrity"],
+        ],
     )
     reconcile_output = tmp_path / "reconciliation.json"
     reconciliation, _ = _run(
         wrapper,
         "reconcile",
-        reconcile_input,
+        "--claims",
+        claims_input,
+        "--approvals",
+        approvals_input,
+        "--integrity",
+        integrity_input,
         "--output",
         reconcile_output,
         expected=0,
@@ -233,15 +237,13 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
         },
     )
     candidate_release = tmp_path / candidate_id
-    build_output = tmp_path / "build-result.json"
     built, _ = _run(
         wrapper,
         "build",
+        "--request",
         build_input,
-        "--release",
+        "--output-dir",
         candidate_release,
-        "--output",
-        build_output,
         expected=0,
     )
     assert built["package"] == {
@@ -251,16 +253,24 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     }
     candidate_before = _snapshot(candidate_release)
 
+    candidate_validation, _ = _run(
+        wrapper,
+        "validate",
+        candidate_release,
+        "--output",
+        tmp_path / "candidate-validation.json",
+        expected=0,
+    )
+    assert candidate_validation["validation"]["status"] == "Candidate"
+
     rejected, _ = _run(
         wrapper,
         "promote",
         candidate_release / "package",
-        "--release",
+        "--output",
         tmp_path / "canonical-rejected",
         "--created-at",
         "2026-08-09T13:00:00Z",
-        "--output",
-        tmp_path / "promotion-rejected.json",
         expected=1,
     )
     assert rejected == {
@@ -283,14 +293,12 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
         wrapper,
         "promote",
         candidate_release / "package",
-        "--release",
-        canonical_release,
         "--approval",
         promotion_approval,
         "--created-at",
         "2026-08-09T13:00:00Z",
         "--output",
-        tmp_path / "promotion.json",
+        canonical_release,
         expected=0,
     )
     assert promoted["package"]["package_id"] == canonical_id
@@ -309,8 +317,19 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
         "readiness": "Ready",
         "status": "Canonical",
         "valid": True,
+        "violation_count": 0,
         "violations": [],
     }
+    canonical_inspection, _ = _run(
+        wrapper,
+        "inspect",
+        canonical_release / f"{canonical_id}.zip",
+        "--output",
+        tmp_path / "canonical-inspection.json",
+        expected=0,
+    )
+    assert canonical_inspection["integrity"]["evidence_state"] == "Verified"
+    assert canonical_inspection["archive"]["code"] == "package-verified"
 
     preflight_input = _json_file(
         tmp_path / "preflight-input.json", reconciliation["report"]
@@ -318,8 +337,9 @@ def test_ready_workflow_preserves_sources_and_candidate_bytes(
     preflight, _ = _run(
         wrapper,
         "preflight",
+        "--reconciliation",
         preflight_input,
-        "--action",
+        "--requested-action",
         "implementation",
         "--output",
         tmp_path / "preflight.json",
@@ -344,6 +364,7 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
     right = tmp_path / "right"
     _complete_handoff(left)
     _complete_handoff(right)
+    sources_before = {"left": _snapshot(left), "right": _snapshot(right)}
 
     findings = []
     for source_id, source in (("left", left), ("right", right)):
@@ -351,8 +372,6 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
             wrapper,
             "inspect",
             source,
-            "--source-id",
-            source_id,
             "--output",
             tmp_path / f"{source_id}.json",
             expected=0,
@@ -366,26 +385,110 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
         _claim("lifecycle", "package status", "Canonical", "left"),
         _claim("action", "authorized action", "implementation", "left"),
     ]
-    reconcile_input = _json_file(
-        tmp_path / "conflict-input.json",
-        {"claims": claims, "approvals": [], "integrity": findings},
-    )
+    claims_input = _json_file(tmp_path / "conflict-claims.json", claims)
+    approvals_input = _json_file(tmp_path / "conflict-approvals.json", [])
+    integrity_input = _json_file(tmp_path / "conflict-integrity.json", findings)
     reconciled, _ = _run(
         wrapper,
         "reconcile",
-        reconcile_input,
+        "--claims",
+        claims_input,
+        "--approvals",
+        approvals_input,
+        "--integrity",
+        integrity_input,
         "--output",
         tmp_path / "conflict-report.json",
         expected=2,
     )
     assert reconciled["report"]["blocking_conflict_ids"]
 
+    blocked_id = "candidate-blocked"
+    selected_hashes = {
+        source_id: _tree_sha256(source)
+        for source_id, source in (("left", left), ("right", right))
+    }
+    blocked_request = _json_file(
+        tmp_path / "blocked-build.json",
+        {
+            "package_id": blocked_id,
+            "project_id": "alpha",
+            "created_at": "2026-08-09T12:30:00Z",
+            "selected_source_hashes": selected_hashes,
+            "reconciliation_report": reconciled["report"],
+            "canonical_files": {"src/app.py": str(left / "app.py")},
+            "rendered_documents": {
+                path: f"# {path}\n\nBlocked Continuity state.\n" for path in DOCUMENT_PATHS
+            },
+            "lineage_data": {
+                "schema": "continuity.lineage/v1",
+                "package_id": blocked_id,
+                "project_id": "alpha",
+                "created_at": "2026-08-09T12:30:00Z",
+                "status": "Candidate",
+                "readiness": "Blocked",
+                "parent_ids": [],
+                "root_package_ids": [],
+                "source_hashes": selected_hashes,
+            },
+            "evidence_index": {
+                "schema": "continuity.evidence-index/v1",
+                "items": [
+                    {"source_id": "left", "state": "Verified", "reference": "sha256"}
+                ],
+            },
+            "secure_handling_approvals": [],
+            "readiness": "Blocked",
+            "allow_conditional_promotion": False,
+        },
+    )
+    blocked_release = tmp_path / blocked_id
+    blocked_build, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        blocked_request,
+        "--output-dir",
+        blocked_release,
+        expected=2,
+    )
+    assert blocked_build["package"]["status"] == "Blocked"
+    assert not any(
+        json.loads(path.read_text(encoding="utf-8"))["status"] == "Candidate"
+        for path in blocked_release.rglob("MANIFEST.json")
+    )
+    blocked_before = _snapshot(blocked_release)
+
+    promotion_approval = _json_file(
+        tmp_path / "blocked-promotion-approval.json",
+        _approval("blocked-promote", "promote-candidate", [blocked_id], "approved"),
+    )
+    canonical_release = tmp_path / "canonical-blocked"
+    failed_promotion, _ = _run(
+        wrapper,
+        "promote",
+        blocked_release,
+        "--approval",
+        promotion_approval,
+        "--created-at",
+        "2026-08-09T13:00:00Z",
+        "--output",
+        canonical_release,
+        expected=1,
+    )
+    assert failed_promotion["ok"] is False
+    assert not canonical_release.exists()
+    assert _snapshot(blocked_release) == blocked_before
+    assert _snapshot(left) == sources_before["left"]
+    assert _snapshot(right) == sources_before["right"]
+
     preflight_input = _json_file(tmp_path / "blocked-input.json", reconciled["report"])
     blocked, _ = _run(
         wrapper,
         "preflight",
+        "--reconciliation",
         preflight_input,
-        "--action",
+        "--requested-action",
         "implementation",
         "--output",
         tmp_path / "blocked-preflight.json",
@@ -394,7 +497,8 @@ def test_architecture_conflict_blocks_candidate_and_implementation_recommendatio
     assert blocked["decision"]["status"] == "Blocked"
     assert blocked["decision"]["exact_next_action"] is None
     assert blocked["decision"]["recommended_superpowers_skill"] is None
-    assert not (tmp_path / "candidate-blocked").exists()
+    assert blocked_release.exists()
+    assert not canonical_release.exists()
 
 
 def test_security_record_unknown_fields_are_rejected_without_path_or_secret_disclosure(
@@ -403,24 +507,27 @@ def test_security_record_unknown_fields_are_rejected_without_path_or_secret_disc
     """Catches permissive approval parsing or exception text leaking sensitive input."""
     wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
     secret = "continuity-secret-value"
-    input_path = _json_file(
-        tmp_path / "bad-input.json",
-        {
-            "claims": [],
-            "approvals": [
-                {
-                    **_approval("bad", "authorize-actions", ["implementation"], "approved"),
-                    "unknown_secret": secret,
-                }
-            ],
-            "integrity": [],
-        },
+    claims_path = _json_file(tmp_path / "empty-claims.json", [])
+    integrity_path = _json_file(tmp_path / "empty-integrity.json", [])
+    approvals_path = _json_file(
+        tmp_path / "bad-approvals.json",
+        [
+            {
+                **_approval("bad", "authorize-actions", ["implementation"], "approved"),
+                "unknown_secret": secret,
+            }
+        ],
     )
 
     payload, completed = _run(
         wrapper,
         "reconcile",
-        input_path,
+        "--claims",
+        claims_path,
+        "--approvals",
+        approvals_path,
+        "--integrity",
+        integrity_path,
         "--output",
         tmp_path / "error.json",
         expected=1,
@@ -447,8 +554,6 @@ def test_missing_output_parent_is_json_user_error_without_traceback(
             str(wrapper),
             "inspect",
             str(source),
-            "--source-id",
-            "source",
             "--output",
             str(tmp_path / "absent" / "result.json"),
         ],
@@ -463,3 +568,247 @@ def test_missing_output_parent_is_json_user_error_without_traceback(
     payload = json.loads(completed.stdout)
     assert payload["ok"] is False
     assert payload["error"]["message"] == "output parent does not exist"
+
+
+@pytest.mark.parametrize("verb", ("inspect", "validate"))
+def test_json_output_cannot_replace_archive_input(
+    tmp_path: Path, repo_root: Path, verb: str
+) -> None:
+    """Catches atomic report publication replacing a read-only ZIP input."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    archive = tmp_path / "evidence.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("evidence.txt", "preserve me")
+    before = archive.read_bytes()
+
+    payload, _ = _run(wrapper, verb, archive, "--output", archive, expected=1)
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert archive.read_bytes() == before
+
+
+@pytest.mark.parametrize("verb", ("inspect", "validate"))
+def test_json_output_cannot_be_inside_source_directory(
+    tmp_path: Path, repo_root: Path, verb: str
+) -> None:
+    """Catches report temp files mutating a directory being inspected or validated."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source = tmp_path / "package"
+    _complete_handoff(source)
+    before = _snapshot(source)
+
+    payload, _ = _run(
+        wrapper, verb, source, "--output", source / "report.json", expected=1
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert _snapshot(source) == before
+
+
+def test_build_output_may_not_contain_a_canonical_source(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches release publication replacing or nesting around canonical evidence."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source_root = tmp_path / "release-overlap"
+    source_root.mkdir()
+    source = source_root / "app.py"
+    source.write_text("preserve = True\n", encoding="utf-8")
+    before = source.read_bytes()
+    request = _json_file(
+        tmp_path / "overlap-build.json",
+        {
+            "package_id": "overlap",
+            "project_id": "alpha",
+            "created_at": "2026-08-09T12:30:00Z",
+            "selected_source_hashes": {"source": "a" * 64},
+            "reconciliation_report": {
+                "claims": [], "conflicts": [], "findings": [], "approvals": [],
+                "selected_claim_ids": [], "blocking_conflict_ids": [], "notes": [],
+            },
+            "canonical_files": {"app.py": str(source)},
+            "rendered_documents": {path: "state\n" for path in DOCUMENT_PATHS},
+            "lineage_data": {},
+            "evidence_index": {},
+            "secure_handling_approvals": [],
+            "readiness": "Ready",
+            "allow_conditional_promotion": False,
+        },
+    )
+
+    payload, _ = _run(
+        wrapper,
+        "build",
+        "--request",
+        request,
+        "--output-dir",
+        source_root,
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert source.read_bytes() == before
+
+
+def test_promotion_output_may_not_be_inside_candidate_release(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches canonical publication mutating the candidate release tree."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "MANIFEST.json").write_text("{}\n", encoding="utf-8")
+    before = _snapshot(candidate)
+    approval = _json_file(
+        tmp_path / "approval.json",
+        _approval("approval", "promote-candidate", ["candidate"], "approved"),
+    )
+
+    payload, _ = _run(
+        wrapper,
+        "promote",
+        candidate,
+        "--approval",
+        approval,
+        "--created-at",
+        "2026-08-09T13:00:00Z",
+        "--output",
+        candidate / "canonical",
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert _snapshot(candidate) == before
+
+
+def test_zip_inspection_requires_verified_package_bytes(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches filenames alone being treated as verified package authority."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    archive = tmp_path / "fabricated.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("MANIFEST.json", "{}\n")
+        output.writestr("SHA256SUMS.txt", "0" * 64 + "  MANIFEST.json\n")
+
+    payload, _ = _run(
+        wrapper, "inspect", archive, "--output", tmp_path / "inspect.json", expected=0
+    )
+
+    assert payload["integrity"]["evidence_state"] == "Contradicted"
+    assert payload["archive"]["code"] == "package-validation-failed"
+    assert "MANIFEST.json" not in json.dumps(payload)
+
+
+def test_safe_non_package_zip_remains_unresolved(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches structural ZIP safety being promoted to evidence authority."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    archive = tmp_path / "notes.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("notes.txt", "unstructured evidence")
+
+    payload, _ = _run(
+        wrapper, "inspect", archive, "--output", tmp_path / "notes.json", expected=0
+    )
+
+    assert payload["integrity"]["evidence_state"] == "Unresolved"
+    assert payload["archive"]["code"] == "package-integrity-evidence-incomplete"
+
+
+def test_malformed_checksum_and_secret_member_are_sanitized(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches archive/package failure details exposing submitted member names or secrets."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    secret = "submitted-secret-filename"
+    archive = tmp_path / "malformed.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("MANIFEST.json", "{}\n")
+        output.writestr("SHA256SUMS.txt", "malformed checksum\n")
+        output.writestr(f"canonical/{secret}.txt", "secret-value")
+
+    payload, completed = _run(
+        wrapper, "inspect", archive, "--output", tmp_path / "result.json", expected=0
+    )
+
+    rendered = json.dumps(payload) + completed.stdout + completed.stderr
+    assert payload["integrity"]["evidence_state"] == "Contradicted"
+    assert secret not in rendered
+    assert "secret-value" not in rendered
+    assert str(tmp_path) not in rendered
+
+    validation, validated = _run(
+        wrapper,
+        "validate",
+        archive,
+        "--output",
+        tmp_path / "validation.json",
+        expected=1,
+    )
+    rendered_validation = json.dumps(validation) + validated.stdout + validated.stderr
+    assert validation["validation"]["violation_count"] > 0
+    assert secret not in rendered_validation
+    assert str(tmp_path) not in rendered_validation
+
+
+def test_json_output_rejects_symlink_parent_redirection(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    """Catches a sibling temp report being redirected outside its explicit parent."""
+    wrapper = repo_root / "skills/project-intelligence/scripts/continuity_cli.py"
+    source = tmp_path / "source"
+    source.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    link = tmp_path / "linked-output"
+    link.symlink_to(redirected, target_is_directory=True)
+
+    payload, _ = _run(
+        wrapper,
+        "inspect",
+        source,
+        "--output",
+        link / "report.json",
+        expected=1,
+    )
+
+    assert payload["error"]["code"] == "invalid_input"
+    assert not (redirected / "report.json").exists()
+
+
+def test_runtime_publication_failure_is_stable_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Catches unavailable no-clobber publication escaping as a traceback."""
+    from continuity import cli
+
+    request = _json_file(
+        tmp_path / "request.json",
+        {
+            "package_id": "candidate", "project_id": "alpha",
+            "created_at": "2026-08-09T12:00:00Z", "selected_source_hashes": {},
+            "reconciliation_report": {
+                "claims": [], "conflicts": [], "findings": [], "approvals": [],
+                "selected_claim_ids": [], "blocking_conflict_ids": [], "notes": [],
+            },
+            "canonical_files": {},
+            "rendered_documents": {path: "state\n" for path in DOCUMENT_PATHS},
+            "lineage_data": {}, "evidence_index": {}, "secure_handling_approvals": [],
+            "readiness": "Ready", "allow_conditional_promotion": False,
+        },
+    )
+    monkeypatch.setattr(
+        cli, "build_candidate", lambda request: (_ for _ in ()).throw(RuntimeError("no replace"))
+    )
+
+    code = cli.main(
+        ["build", "--request", str(request), "--output-dir", str(tmp_path / "release")]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["error"]["message"] == "operation failed validation or could not be completed"
