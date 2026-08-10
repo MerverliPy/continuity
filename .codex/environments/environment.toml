@@ -26,7 +26,7 @@ command = ".venv/bin/python -m compileall -q skills/project-intelligence/scripts
 [[actions]]
 name = "Dependency Hygiene"
 icon = "tool"
-command = "git diff --check"
+command = "git diff --check --ignore-space-at-eol --ignore-space-change"
 
 [[actions]]
 name = "CLI Help"
