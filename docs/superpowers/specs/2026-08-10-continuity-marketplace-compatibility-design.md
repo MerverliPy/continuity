@@ -19,7 +19,8 @@ The repository root is both the marketplace root and the Continuity plugin
 root. The catalog contains exactly one entry:
 
 - marketplace name: `continuity-local`
-- display name: `Continuity Local`
+- marketplace interface display name: `Continuity Local` via
+  `interface.displayName`
 - plugin name: `continuity`
 - source type: `local`
 - source path: `./`

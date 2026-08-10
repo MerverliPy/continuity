@@ -4,7 +4,7 @@
 
 **Goal:** Make the existing Continuity plugin discoverable from its repository root by the Codex local-marketplace command used on CALVINPC.
 
-**Architecture:** Add one catalog at \`.agents/plugins/marketplace.json\`. Its only entry points at the repository root with \`./\`, reusing \`.codex-plugin/plugin.json\` and \`skills/\` rather than creating a second plugin copy. A contract test prevents policy, identity, or source-path drift; documentation distinguishes marketplace registration from host installation and evaluation.
+**Architecture:** Add one catalog at \`.agents/plugins/marketplace.json\`. Its only entry points at the repository root with \`./\`, reusing \`.codex-plugin/plugin.json\` and \`skills/\` rather than creating a second plugin copy. The marketplace title uses the current \`interface.displayName\` contract. A contract test prevents policy, identity, or source-path drift; documentation distinguishes marketplace registration from host installation and evaluation.
 
 **Tech Stack:** JSON marketplace manifest; Python 3.11+ pytest contract suite; Markdown; Codex CLI local marketplace registration.
 
@@ -38,7 +38,7 @@ continuity/
 \`\`\`json
 {
   "name": "continuity-local",
-  "metadata": {"display_name": "Continuity Local"},
+  "interface": {"displayName": "Continuity Local"},
   "plugins": [
     {
       "name": "continuity",
@@ -81,7 +81,7 @@ def test_local_marketplace_reuses_the_existing_continuity_plugin(
     marketplace = json.loads(marketplace_path.read_text())
     assert marketplace == {
         "name": "continuity-local",
-        "metadata": {"display_name": "Continuity Local"},
+        "interface": {"displayName": "Continuity Local"},
         "plugins": [
             {
                 "name": "continuity",
@@ -177,7 +177,7 @@ Expected: FAIL because the required wording is absent.
 
 - [ ] **Step 3: Update README.**
 
-Immediately after \`## Plugin bundle and local Python distribution\`, insert \`## Local marketplace registration\` with:
+After the opening overview, add \`## Local marketplace registration\` with:
 
 \`\`\`bash
 cd /path/to/continuity-v1
@@ -288,4 +288,3 @@ Plan complete and saved to \`docs/superpowers/plans/2026-08-10-continuity-market
 
 1. **Subagent-Driven (recommended)** — dispatch a fresh subagent per task, review between tasks.
 2. **Inline Execution** — execute the tasks in this session using \`superpowers:executing-plans\`, with checkpoints for review.
-

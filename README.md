@@ -4,6 +4,16 @@ Continuity is a skills-first ChatGPT and Codex plugin for preservation-first pro
 
 Version 1 operates on files available in the active workspace. Original evidence stays read-only, timestamps never establish authority by themselves, and no unsupported claim is upgraded to verified fact.
 
+## Local marketplace registration
+
+From the Continuity repository root, register the repository-scoped marketplace:
+
+```bash
+codex plugin marketplace add .
+```
+
+An exit code of `0` records the local marketplace source only. Restart an eligible ChatGPT desktop/work surface, select **Continuity Local** in the **Plugins Directory**, install the plugin, and record the plugin version and Git commit before running host cases. Codex marketplace registration does not prove skill routing or host-level evaluation.
+
 ## Plugin bundle and local Python distribution
 
 ChatGPT or Codex plugin installation uses the plugin bundle: `.codex-plugin/plugin.json` and the `skills/` layout. A Python wheel does not install ChatGPT skills.

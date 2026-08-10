@@ -53,6 +53,8 @@ Run the matrix contract independently with:
 
 ## Host-level ChatGPT evaluator method
 
+Before running any case, record successful marketplace registration for the exact checkout and confirm that **Continuity Local** is installed from the **Plugins Directory** on the eligible host. A failed registration, unavailable Plugins Directory, or a host without access to the marketplace makes the host suite incomplete; mark each affected case `not run`, not passed.
+
 Prompt-only host runs evaluate routing and response semantics. They do not prove that any source bytes remained unchanged because the prompts describe evidence but do not upload concrete files. A `prompt_only` case may use this mode; an `artifact_required` case may not. For every release candidate:
 
 1. Install the exact plugin build being evaluated and record its version and Git commit.

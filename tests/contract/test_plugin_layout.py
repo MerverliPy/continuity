@@ -18,6 +18,48 @@ def test_plugin_manifest_declares_skills_only(repo_root: Path) -> None:
     assert "mcpServers" not in manifest
 
 
+def test_local_marketplace_reuses_the_existing_continuity_plugin(
+    repo_root: Path,
+) -> None:
+    marketplace_path = repo_root / ".agents/plugins/marketplace.json"
+    marketplace = json.loads(marketplace_path.read_text())
+    assert marketplace == {
+        "name": "continuity-local",
+        "interface": {"displayName": "Continuity Local"},
+        "plugins": [
+            {
+                "name": "continuity",
+                "source": {"source": "local", "path": "./"},
+                "policy": {
+                    "installation": "AVAILABLE",
+                    "authentication": "ON_INSTALL",
+                },
+                "category": "Productivity",
+            }
+        ],
+    }
+    source_path = marketplace["plugins"][0]["source"]["path"]
+    assert source_path.startswith("./")
+    resolved_source = (repo_root / source_path).resolve()
+    assert resolved_source == repo_root.resolve()
+    plugin_manifest = json.loads(
+        (resolved_source / ".codex-plugin/plugin.json").read_text()
+    )
+    assert plugin_manifest["name"] == "continuity"
+
+
+def test_documentation_separates_marketplace_registration_from_host_evaluation(
+    repo_root: Path,
+) -> None:
+    readme = (repo_root / "README.md").read_text()
+    evaluation = (repo_root / "docs/evaluation.md").read_text()
+    assert "codex plugin marketplace add ." in readme
+    assert "Plugins Directory" in readme
+    assert "does not prove skill routing" in readme
+    assert "marketplace registration" in evaluation
+    assert "not run" in evaluation
+
+
 def test_five_skill_files_exist(repo_root: Path) -> None:
     expected = {
         "project-intelligence",
