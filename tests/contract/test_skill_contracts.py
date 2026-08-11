@@ -102,6 +102,17 @@ def test_skill_workflow_preserves_operating_boundaries(
     assert "Superpowers is absent" in document
 
 
+def test_reconciliation_skill_locks_prompt_only_evaluation_rule(repo_root: Path) -> None:
+    document = (repo_root / "skills/reconcile-project-state/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "prompt_only" in document
+    assert "facts supplied in the prompt" in document
+    assert "do not claim textual paths were opened" in document
+    assert "artifact_required" in document
+
+
 def test_bundled_templates_expose_evidence_authority_and_readiness_fields(
     repo_root: Path,
 ) -> None:
