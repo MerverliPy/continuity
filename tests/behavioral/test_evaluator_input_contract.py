@@ -141,3 +141,25 @@ def test_cli_refuses_existing_output_without_modifying_it(
 
     assert result.returncode != 0
     assert output.read_bytes() == original
+
+
+def test_cli_refuses_a_dangling_symlink_output_without_modifying_it(
+    repo_root: Path, tmp_path: Path
+) -> None:
+    """Catches a dangling output link being followed and populated by the CLI."""
+    target = tmp_path / "missing-target.txt"
+    output = tmp_path / "dangling-output.txt"
+    output.symlink_to(target)
+
+    result = _run_cli(
+        repo_root,
+        "--case-id",
+        "older_complete_newer_incomplete",
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode != 0
+    assert output.is_symlink()
+    assert os.readlink(output) == str(target)
+    assert not target.exists()

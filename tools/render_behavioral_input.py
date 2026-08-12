@@ -25,9 +25,9 @@ def main() -> None:
     if case.get("evaluation_mode") != "prompt_only":
         parser.error(f"case is not prompt_only: {args.case_id}")
 
+    if args.output.exists() or args.output.is_symlink():
+        parser.error(f"refusing to overwrite {args.output}")
     output = args.output.resolve()
-    if output.exists():
-        parser.error(f"refusing to overwrite {output}")
     if not output.parent.is_dir():
         parser.error(f"output parent does not exist: {output.parent}")
 
