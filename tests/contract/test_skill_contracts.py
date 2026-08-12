@@ -108,6 +108,9 @@ def test_reconciliation_skill_locks_prompt_only_evaluation_rule(repo_root: Path)
     )
 
     assert "prompt_only" in document
+    assert "continuity.behavioral-input/v1" in document
+    assert "Evaluation mode: prompt_only" in document
+    assert "supplied context" in document
     assert "facts supplied in the prompt" in document
     assert "do not claim textual paths were opened" in document
     assert "artifact_required" in document

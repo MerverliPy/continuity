@@ -59,7 +59,19 @@ Prompt-only host runs evaluate routing and response semantics. They do not prove
 
 1. Install the exact plugin build being evaluated and record its version and Git commit.
 2. Start a fresh ChatGPT conversation for each case so earlier context cannot affect routing or authority.
-3. Check `evaluation_mode`. For `prompt_only`, submit the case's `prompt` verbatim. The prompt supplies evaluation facts as text; do not add unstated approvals or evidence and do not claim that textual paths were opened by a tool. For `artifact_required`, follow the artifact workflow below instead.
+3. Check `evaluation_mode`. For `prompt_only`, render the model-visible input for the case:
+
+   ```bash
+   set -euo pipefail
+   case_id=older_complete_newer_incomplete
+   input_path="$evidence_root/${case_id}.model-input.txt"
+   .venv/bin/python tools/render_behavioral_input.py \
+     --case-id "$case_id" \
+     --output "$input_path"
+   sha256sum "$input_path" | tee "$evidence_root/${case_id}.model-input.sha256.txt"
+   ```
+
+   Paste the complete generated file byte-for-byte into a fresh conversation and add no other evaluation envelope. The raw `case["prompt"]` remains a locked body fixture; the generated input is the versioned, model-visible stimulus. It supplies evaluation facts as text, so do not add unstated approvals or evidence and do not claim that textual paths were opened by a tool. `artifact_required` cases bypass the renderer and use the existing staged-artifact procedure below.
 4. Record the skill ChatGPT activates. It must equal `expected_skill`.
 5. Record the status ChatGPT reports. It must equal `expected_status` in the relevant evidence, readiness, or lifecycle context.
 6. Evaluate every `required_assertions` key semantically and capture a short response excerpt or artifact reference as evidence.

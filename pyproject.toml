@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "continuity"
-version = "1.0.0"
+version = "1.0.1"
 description = "Preservation-first project intelligence and canonical handoffs for long-running work."
 readme = "README.md"
 requires-python = ">=3.11"

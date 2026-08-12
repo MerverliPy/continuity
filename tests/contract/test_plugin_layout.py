@@ -9,12 +9,15 @@ import tomllib
 
 def test_plugin_manifest_declares_skills_only(repo_root: Path) -> None:
     manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
+    configuration = tomllib.loads((repo_root / "pyproject.toml").read_text())
     assert manifest == {
         "name": "continuity",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "description": "Preservation-first project intelligence and canonical handoffs for long-running work.",
         "skills": "./skills/",
     }
+    assert manifest["version"] == "1.0.1"
+    assert configuration["project"]["version"] == manifest["version"]
     assert "mcpServers" not in manifest
 
 

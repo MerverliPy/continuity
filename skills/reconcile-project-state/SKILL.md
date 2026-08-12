@@ -25,7 +25,7 @@ Load only the directly relevant reference files: classify evidence with `skills/
 
 ## Prompt-only evaluation rule
 
-When a locked behavioral evaluation explicitly identifies its mode as `prompt_only`, treat the stated integrity, lineage, approval, and requested-action facts as facts supplied in the prompt. Cite the stated source paths and record IDs as supplied context; do not claim textual paths were opened, hashed, or inspected by a tool. Do not downgrade readiness solely because those named paths are not available in the local workspace. This rule never supplies unstated facts, does not apply to ordinary workspace reconciliation, and does not apply to `artifact_required` cases, which require staged artifacts and actual tool evidence.
+When an evaluation message explicitly begins with the `continuity.behavioral-input/v1` evaluator contract and states `Evaluation mode: prompt_only`, treat only the stated integrity, lineage, approval, and requested-action facts as supplied context. These are facts supplied in the prompt: cite the stated source paths and record IDs as supplied context, but do not claim textual paths were opened, hashed, or independently inspected by a tool. Do not downgrade readiness solely because those named paths are not available in the local workspace. This rule never supplies unstated facts, does not apply to ordinary workspace reconciliation, and does not apply to `artifact_required` cases, which require staged artifacts and actual tool evidence.
 
 ## Output contract
 
