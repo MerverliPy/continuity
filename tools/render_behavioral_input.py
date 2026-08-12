@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 
 from continuity.evaluation import render_prompt_only_input
 
@@ -25,23 +26,42 @@ def main() -> None:
     if case.get("evaluation_mode") != "prompt_only":
         parser.error(f"case is not prompt_only: {args.case_id}")
 
-    if args.output.exists() or args.output.is_symlink():
-        parser.error(f"refusing to overwrite {args.output}")
-    output = args.output.resolve()
-    if not output.parent.is_dir():
-        parser.error(f"output parent does not exist: {output.parent}")
+    requested_output = args.output
+    if requested_output.exists() or requested_output.is_symlink():
+        parser.error(f"refusing to overwrite {requested_output}")
+    output_parent = requested_output.parent.resolve()
+    if not output_parent.is_dir():
+        parser.error(f"output parent does not exist: {output_parent}")
+    output = output_parent / requested_output.name
+    if output.exists() or output.is_symlink():
+        parser.error(f"refusing to overwrite {output}")
 
     rendered = render_prompt_only_input(args.case_id, case["prompt"])
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-    temporary.write_bytes(rendered.encode("utf-8"))
+    rendered_bytes = rendered.encode("utf-8")
+    temporary: Path | None = None
+    descriptor = -1
     try:
-        os.link(temporary, output)
-    except FileExistsError:
-        parser.error(f"refusing to overwrite {output}")
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=output_parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with stream:
+            stream.write(rendered_bytes)
+        try:
+            os.link(temporary, output)
+        except FileExistsError:
+            parser.error(f"refusing to overwrite {output}")
     finally:
-        temporary.unlink(missing_ok=True)
+        if descriptor != -1:
+            os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
-    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    digest = hashlib.sha256(rendered_bytes).hexdigest()
     print(f"SHA256={digest}")
     print(f"OUTPUT={output}")
 

@@ -9,7 +9,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from continuity.evaluation import render_prompt_only_input
+from tools import render_behavioral_input
 
 
 PROMPT_ONLY_INPUT_SHA256 = {
@@ -160,6 +163,91 @@ def test_cli_refuses_a_dangling_symlink_output_without_modifying_it(
     )
 
     assert result.returncode != 0
+    assert output.is_symlink()
+    assert os.readlink(output) == str(target)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("stale_kind", ["file", "symlink"])
+def test_cli_does_not_alter_a_preexisting_predictable_temporary_entry(
+    repo_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stale_kind: str,
+) -> None:
+    """Catches predictable temporary names overwriting stale filesystem entries."""
+    output = tmp_path / "rendered-input.txt"
+    predictable = tmp_path / f".{output.name}.{os.getpid()}.tmp"
+    stale_bytes = b"preexisting temporary entry"
+    victim = tmp_path / "temporary-symlink-victim.txt"
+    if stale_kind == "file":
+        predictable.write_bytes(stale_bytes)
+    else:
+        victim.write_bytes(stale_bytes)
+        predictable.symlink_to(victim)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_behavioral_input.py",
+            "--case-id",
+            "older_complete_newer_incomplete",
+            "--output",
+            str(output),
+        ],
+    )
+
+    render_behavioral_input.main()
+
+    assert output.is_file()
+    if stale_kind == "file":
+        assert predictable.is_file()
+        assert predictable.read_bytes() == stale_bytes
+    else:
+        assert predictable.is_symlink()
+        assert os.readlink(predictable) == str(victim)
+        assert victim.read_bytes() == stale_bytes
+
+
+def test_cli_never_follows_a_destination_symlink_inserted_after_validation(
+    repo_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches output-leaf resolution following a symlink introduced by a race."""
+    output = tmp_path / "racing-output.txt"
+    target = tmp_path / "redirected-target.txt"
+    real_resolve = Path.resolve
+    inserted = False
+
+    def insert_symlink_before_resolution(
+        path: Path, *args: object, **kwargs: object
+    ) -> Path:
+        nonlocal inserted
+        if not inserted:
+            assert not output.exists()
+            output.symlink_to(target)
+            inserted = True
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", insert_symlink_before_resolution)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_behavioral_input.py",
+            "--case-id",
+            "older_complete_newer_incomplete",
+            "--output",
+            str(output),
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        render_behavioral_input.main()
+
+    assert inserted
     assert output.is_symlink()
     assert os.readlink(output) == str(target)
     assert not target.exists()
