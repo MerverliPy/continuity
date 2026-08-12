@@ -23,6 +23,10 @@ Use this skill when inspection reports, integrity findings, lineage records, or 
 
 Load only the directly relevant reference files: classify evidence with `skills/project-intelligence/references/evidence-states.md` and check portable authority/lifecycle constraints with `skills/project-intelligence/references/package-contract.md`. For every material claim, quote or cite the inspected file path and record ID. Keep source evidence read-only. Use the Continuity CLI for hashes, archive inspection, manifests, validation, and packaging so comparisons use deterministic records. Pause for exactly scoped user authority when material conflicts exist; do not infer a decision from age, urgency, or broad approval. Never label a `Candidate` as `Canonical`, and never route a `Blocked` package into execution. Return a useful Continuity reconciliation result even if Superpowers is absent.
 
+## Prompt-only evaluation rule
+
+When an evaluation message explicitly begins with the `continuity.behavioral-input/v1` evaluator contract and states `Evaluation mode: prompt_only`, treat only the stated integrity, lineage, approval, and requested-action facts as supplied context. These are facts supplied in the prompt: cite the stated source paths and record IDs as supplied context, but do not claim textual paths were opened, hashed, or independently inspected by a tool. Do not downgrade readiness solely because those named paths are not available in the local workspace. This rule never supplies unstated facts, does not apply to ordinary workspace reconciliation, and does not apply to `artifact_required` cases, which require staged artifacts and actual tool evidence.
+
 ## Output contract
 
 Return a reconciliation report with the selected project, compared sources, integrity and lineage findings, claim provenance, inspected file path and record ID for every material claim, materiality classification, required approval records, prohibited actions, and a `Ready`, `Conditional`, or `Blocked` readiness basis. It never upgrades unsupported claims to `Verified`.
